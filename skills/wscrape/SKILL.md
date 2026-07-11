@@ -56,6 +56,8 @@ Follow this escalation:
 3. **map + scrape** — large site, need a specific subpage. Map to find URL, then scrape.
 4. **crawl** — need bulk content from an entire section.
 5. **gather** — have a *question*, not a URL list. Adaptively crawls from a start URL until it has enough to answer the query.
+6. **scholar** — searching *academic literature*? Federates Crossref + arXiv + Europe PMC into one ranked, deduplicated result set. No URL needed.
+7. **news** — searching *news articles*? Federates GDELT (and optional Google News) into one recency-ranked, deduplicated set.
 
 ## Output directory
 
@@ -66,6 +68,7 @@ Always use `var/wscrape/` in the project working directory. Use `-o` to write to
 # Search
 wscrape search "query" -o var/wscrape/search-query.json
 wscrape search "query" --limit 10 -o var/wscrape/search-query.json
+wscrape search "local events" --region uk-en --recent m   # anchor locale + past month (cuts noise)
 
 # Scrape single page (returns boilerplate-stripped content by default)
 wscrape scrape https://example.com -o var/wscrape/example.md
@@ -87,6 +90,14 @@ wscrape crawl https://docs.example.com --keywords "auth,oauth,token" -o var/wscr
 # Gather — answer a question by adaptive crawl
 wscrape gather https://docs.example.com --query "how does token refresh work" -o var/wscrape/gather.md
 wscrape gather https://docs.example.com --query "rate limits" --limit 15 --json -o var/wscrape/gather.json
+
+# Scholar — academic literature (federated, keyless)
+wscrape scholar "diffusion models for image generation" --limit 10 -o var/wscrape/papers.md
+wscrape scholar "mRNA vaccine" --since-year 2023 --open-access --json -o var/wscrape/papers.json
+
+# News — news articles (GDELT by default, keyless)
+wscrape news "interest rate cuts" --recent w --limit 10 -o var/wscrape/news.md
+wscrape news "central bank policy" --hydrate --limit 8 -o var/wscrape/news.md   # add real snippets
 ```
 
 ### Fetch flags (scrape, map, crawl)
@@ -97,9 +108,14 @@ wscrape gather https://docs.example.com --query "rate limits" --limit 15 --json 
 | `--query` | Return only passages relevant to the query, via BM25 (scrape, crawl) |
 | `--keywords` | Crawl *toward* relevant pages using relevance scoring (crawl only) |
 | `--seed` | Discover URLs via sitemap/Common Crawl: `sitemap`, `cc`, `sitemap+cc` (map only) |
+| `--magic` | Auto-dismiss cookie/consent overlays; uses the browser path (scrape, crawl) |
+| `--scroll` | Scroll to load lazy / infinite-scroll content; uses the browser path (scrape, crawl) |
 | `--cache` | Use crawl4ai's cache for speed on repeat fetches |
 | `--fresh` | Bypass the cache and always fetch (this is the **default**) |
 | `--robots` | Respect the site's robots.txt |
+
+Search accepts `--region` (e.g. `uk-en`) and `--recent` (`d`/`w`/`m`/`y`) to
+anchor locale and freshness — use them to cut noise on generic or dated queries.
 
 By default `scrape`/`crawl` strip navigation, footers, and boilerplate for higher
 signal density. Use `--raw` when you need the complete page (footnotes, sidebars,
@@ -128,6 +144,34 @@ wscrape scrape https://site1.com -o var/wscrape/1.md &
 wscrape scrape https://site2.com -o var/wscrape/2.md &
 wait
 ```
+
+## Academic search (scholar)
+
+`scholar` federates keyless academic APIs — **Crossref** (cross-publisher backbone), **arXiv** (preprints), **Europe PMC** (biomedical) — merges them with reciprocal rank fusion, deduplicates by DOI, and surfaces citation counts. No API key required.
+
+```bash
+wscrape scholar "<query>" [--limit N] [--since-year YYYY] [--open-access] [--json]
+```
+
+- Markdown digest by default (title, authors, year, venue, citations, DOI/URL, abstract); `--json` emits structured records for programmatic use.
+- A **coverage line on stderr** reports which engines answered, failed, or were skipped — read it to judge recall confidence (e.g. `crossref ok (10)  arxiv ok (10)  europepmc ok (8)`).
+- Prefer `scholar` over `search` for papers, DOIs, citations, and literature reviews — it returns typed, deduplicated academic records rather than noisy web hits.
+
+**Optional keyed engines** — OpenAlex and Semantic Scholar join the federation automatically when an API key is available; otherwise they're silently skipped and scholar works fully keyless.
+
+
+## News search (news)
+
+`news` federates news sources into one recency-ranked, deduplicated set. **GDELT 2.0** (keyless, global, 65 languages, ~3-month window) is the default workhorse. No API key required.
+
+```bash
+wscrape news "<query>" [--limit N] [--recent d|w|m|y] [--google-news] [--hydrate] [--json]
+```
+
+- Prefer `news` over `search` for current events, headlines, and press coverage — it returns typed, deduplicated articles ranked newest-first.
+- GDELT returns title, outlet, date, and URL but **no snippet body**. Add `--hydrate` to fetch the top results and attach real snippets (bounded, so it stays cheap).
+- **`--google-news`** additionally queries Google News RSS. Its terms permit **personal, non-commercial use only** — wscrape prints that caveat to stderr; keep it off when results may inform work product. Its `rss/articles/…` links can't be resolved without a browser, so `--hydrate` skips them.
+- A **coverage line on stderr** reports which engines answered (GDELT rate-limits to ~1 request/5s, so an occasional `gdelt failed: HTTP 429` is normal — retry shortly).
 
 ## Reddit
 
@@ -175,6 +219,9 @@ wscrape transcript https://www.youtube.com/watch?v=VIDEO_ID --lang fr -o var/wsc
 ## Troubleshooting
 
 - **Empty/thin output from scrape**: add `--js` flag (site needs Playwright)
+- **Cookie/consent wall or thin dynamic page**: add `--magic` (dismiss overlays) and/or `--scroll` (load lazy content)
+- **Cloudflare / anti-bot block**: wscrape can't reliably fetch bot-protected pages — use a real browser tool for those few pages; don't retry endlessly
+- **Noisy or off-topic search results**: anchor with `--region` and `--recent`, and make the query geographically/temporally specific
 - **Search returns few results**: DuckDuckGo may be rate-limiting, wait 30s and retry
 - **Crawl visits wrong pages**: use `--include /path` to restrict to a site section
 - **Reddit post/subreddit fetch returns `403 Blocked`**: Reddit blocks `.json` endpoints from data-center IPs. Use `--search` (DuckDuckGo, always works) to find content, or run from a residential IP for full post/comment fetches.

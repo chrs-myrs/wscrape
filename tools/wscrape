@@ -108,6 +108,9 @@ def main():
     p_search = sub.add_parser("search", help="Web search via DuckDuckGo")
     p_search.add_argument("query")
     p_search.add_argument("--limit", type=int, default=10)
+    p_search.add_argument("--region", help="Locale to anchor results, e.g. uk-en, us-en (default worldwide)")
+    p_search.add_argument("--recent", choices=["d", "w", "m", "y"],
+                          help="Limit to the past day/week/month/year")
     p_search.add_argument("-o", "--output", help="Write output to file")
 
     p_scrape = sub.add_parser("scrape", help="Extract content from a URL")
@@ -115,6 +118,10 @@ def main():
     p_scrape.add_argument("--js", action="store_true", help="Force Playwright (skip static attempt)")
     p_scrape.add_argument("--raw", action="store_true", help="Return full page content instead of boilerplate-stripped")
     p_scrape.add_argument("--query", help="Return passages relevant to this query (BM25; forces JS path)")
+    p_scrape.add_argument("--magic", action="store_true",
+                          help="Auto-dismiss cookie/consent overlays (uses the browser path)")
+    p_scrape.add_argument("--scroll", action="store_true",
+                          help="Scroll to load lazy/infinite content (uses the browser path)")
     _add_fetch_flags(p_scrape)
     p_scrape.add_argument("-o", "--output")
 
@@ -135,6 +142,8 @@ def main():
     p_crawl.add_argument("--keywords", help="Comma-separated keywords to crawl toward (relevance-scored)")
     p_crawl.add_argument("--query", help="Return passages relevant to this query (BM25 content filter)")
     p_crawl.add_argument("--raw", action="store_true", help="Return full page content instead of boilerplate-stripped")
+    p_crawl.add_argument("--magic", action="store_true", help="Auto-dismiss cookie/consent overlays")
+    p_crawl.add_argument("--scroll", action="store_true", help="Scroll to load lazy/infinite content")
     _add_fetch_flags(p_crawl)
     p_crawl.add_argument("-o", "--output")
 
@@ -145,6 +154,29 @@ def main():
     p_gather.add_argument("--confidence", type=float, default=0.7, help="Stop when confidence reaches this (0-1)")
     p_gather.add_argument("--json", action="store_true", help="Output structured JSON instead of a markdown digest")
     p_gather.add_argument("-o", "--output")
+
+    p_scholar = sub.add_parser("scholar", help="Search academic literature (federated keyless APIs)")
+    p_scholar.add_argument("query")
+    p_scholar.add_argument("--limit", type=int, default=10, help="Max merged results")
+    p_scholar.add_argument("--since-year", type=int, help="Only results published in or after this year")
+    p_scholar.add_argument("--open-access", action="store_true",
+                           help="Only open-access results (where the source exposes the flag)")
+    p_scholar.add_argument("--json", action="store_true", help="Output structured JSON instead of a markdown digest")
+    p_scholar.add_argument("-o", "--output")
+
+    p_news = sub.add_parser("news", help="Search news (GDELT; optional Google News)")
+    p_news.add_argument("query")
+    p_news.add_argument("--limit", type=int, default=10)
+    p_news.add_argument("--recent", choices=["d", "w", "m", "y"],
+                        help="Recency window (GDELT covers a ~3-month rolling window)")
+    p_news.add_argument("--lang", default="en", help="Language for Google News (default: en)")
+    p_news.add_argument("--country", default="US", help="Country for Google News (default: US)")
+    p_news.add_argument("--google-news", action="store_true",
+                        help="Also query Google News RSS (personal, non-commercial use only)")
+    p_news.add_argument("--hydrate", action="store_true",
+                        help="Fetch top results to add snippets and resolve redirect URLs")
+    p_news.add_argument("--json", action="store_true", help="Output structured JSON instead of a digest")
+    p_news.add_argument("-o", "--output")
 
     p_reddit = sub.add_parser("reddit", help="Fetch Reddit content via API")
     p_reddit.add_argument("target", help="Reddit URL or search query")
@@ -167,33 +199,76 @@ def main():
         "map": cmd_map,
         "crawl": cmd_crawl,
         "gather": cmd_gather,
+        "scholar": cmd_scholar,
+        "news": cmd_news,
         "reddit": cmd_reddit,
         "transcript": cmd_transcript,
     }
     dispatch[args.command](args)
 
 
+# DuckDuckGo's default backend has been returning space-stripped titles and
+# empty snippet bodies; these named backends return clean, usable results.
+_SEARCH_BACKENDS = ["auto", "html", "lite"]
+
+
+def _repair_title(title: str, query: str) -> str:
+    """Re-space ddgs titles where highlighted query terms lost their spaces.
+
+    ddgs strips <b> highlight markup from titles without preserving the
+    surrounding whitespace, gluing query terms to neighbours
+    (e.g. 'attendTowerHamletsfestivals'). We only re-insert spaces around the
+    actual query words, so brand casing like 'TikTok' is left untouched.
+    """
+    terms = sorted({t for t in re.findall(r"[A-Za-z0-9]+", query) if len(t) > 2},
+                   key=len, reverse=True)
+    for term in terms:
+        esc = re.escape(term)
+        title = re.sub(rf"(?<=[A-Za-z0-9])({esc})", r" \1", title, flags=re.IGNORECASE)
+        title = re.sub(rf"({esc})(?=[A-Za-z0-9])", r"\1 ", title, flags=re.IGNORECASE)
+    return re.sub(r"\s{2,}", " ", title).strip()
+
+
 def cmd_search(args):
     import io
     from ddgs import DDGS
 
+    region = args.region or "wt-wt"
+    raw: list = []
+    fallback: list = []
+    err = None
+    old_stderr = sys.stderr
+    sys.stderr = io.StringIO()  # ddgs is noisy on stderr
     try:
-        old_stderr = sys.stderr
-        sys.stderr = io.StringIO()
-        try:
-            ddgs = DDGS()
-            raw = list(ddgs.text(args.query, max_results=args.limit))
-        finally:
-            sys.stderr = old_stderr
-    except Exception as e:
-        print(f"Search failed: {e}", file=sys.stderr)
+        for backend in _SEARCH_BACKENDS:
+            try:
+                rows = list(DDGS().text(
+                    args.query, max_results=args.limit,
+                    region=region, timelimit=args.recent, backend=backend,
+                ))
+            except Exception as e:  # noqa: BLE001 — try the next backend
+                err = e
+                continue
+            if not rows:
+                continue
+            # Prefer a backend that returns usable snippet bodies (for triage).
+            if any((r.get("body") or "").strip() for r in rows):
+                raw = rows
+                break
+            fallback = fallback or rows
+    finally:
+        sys.stderr = old_stderr
+
+    raw = raw or fallback
+    if not raw:
+        print(f"Search failed: {err or 'no results'}", file=sys.stderr)
         sys.exit(1)
 
     results = [
         {
-            "title": r.get("title", ""),
-            "url": r.get("href", ""),
-            "snippet": r.get("body", ""),
+            "title": _repair_title(r.get("title") or "", args.query),
+            "url": r.get("href") or r.get("url") or "",
+            "snippet": (r.get("body") or "").strip(),
         }
         for r in raw
     ]
@@ -220,7 +295,8 @@ async def _scrape_static(url: str, want_raw: bool) -> str:
     return extracted or ""
 
 
-async def _scrape_js(url: str, want_raw: bool, query: str | None, use_cache: bool, robots: bool) -> str:
+async def _scrape_js(url: str, want_raw: bool, query: str | None, use_cache: bool,
+                     robots: bool, magic: bool = False, scroll: bool = False) -> str:
     from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 
     config = CrawlerRunConfig(
@@ -228,6 +304,8 @@ async def _scrape_js(url: str, want_raw: bool, query: str | None, use_cache: boo
         markdown_generator=_build_markdown_generator(want_raw, query),
         cache_mode=_resolve_cache_mode(use_cache),
         check_robots_txt=robots,
+        magic=magic,                 # dismiss consent/overlay walls
+        scan_full_page=scroll,       # load lazy / infinite-scroll content
     )
     async with AsyncWebCrawler(config=BrowserConfig(verbose=False)) as crawler:
         result = await crawler.arun(url=url, config=config)
@@ -247,23 +325,26 @@ async def _scrape_js(url: str, want_raw: bool, query: str | None, use_cache: boo
 
 
 async def _do_scrape(url: str, force_js: bool, want_raw: bool, query: str | None,
-                     use_cache: bool, robots: bool) -> str:
-    # A query needs rendered content for BM25, so it forces the crawl4ai path.
-    if not force_js and not query:
+                     use_cache: bool, robots: bool, magic: bool = False,
+                     scroll: bool = False) -> str:
+    # A query (BM25) or a browser-only flag (magic/scroll) needs the rendered
+    # page, so any of them forces the crawl4ai path over the static attempt.
+    if not force_js and not query and not magic and not scroll:
         try:
             content = await _scrape_static(url, want_raw)
             if len(content.strip()) >= 200:
                 return content
         except Exception:
             pass  # Fall through to Playwright
-    return await _scrape_js(url, want_raw, query, use_cache, robots)
+    return await _scrape_js(url, want_raw, query, use_cache, robots, magic, scroll)
 
 
 def cmd_scrape(args):
     try:
         with _quiet_crawl4ai():
             content = asyncio.run(
-                _do_scrape(args.url, args.js, args.raw, args.query, _want_cache(args), args.robots)
+                _do_scrape(args.url, args.js, args.raw, args.query, _want_cache(args),
+                           args.robots, args.magic, args.scroll)
             )
     except Exception as e:
         print(f"Scrape failed: {e}", file=sys.stderr)
@@ -354,6 +435,7 @@ def _build_deep_crawl_strategy(limit, max_depth, include_paths, keywords):
 async def _do_crawl(
     url: str, limit: int, max_depth: int, include_paths: list[str], keywords: list[str],
     want_raw: bool, query: str | None, use_cache: bool, robots: bool,
+    magic: bool = False, scroll: bool = False,
 ) -> list[dict]:
     """Crawl a site section using crawl4ai's native deep-crawl strategy."""
     from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
@@ -363,6 +445,8 @@ async def _do_crawl(
         markdown_generator=_build_markdown_generator(want_raw, query),
         cache_mode=_resolve_cache_mode(use_cache),
         check_robots_txt=robots,
+        magic=magic,
+        scan_full_page=scroll,
     )
 
     results: list[dict] = []
@@ -391,6 +475,7 @@ def cmd_crawl(args):
                 _do_crawl(
                     args.url, args.limit, args.depth, include, keywords,
                     args.raw, args.query, _want_cache(args), args.robots,
+                    args.magic, args.scroll,
                 )
             )
     except Exception as e:
@@ -440,6 +525,533 @@ def cmd_gather(args):
         _write_output(json.dumps(pages, indent=2), args.output)
     else:
         _write_output(_format_gather_digest(pages, args.query), args.output)
+
+
+# ── scholar: federated academic search ──────────────────────────────────────
+#
+# Keyless-first (REQ-013): Crossref + arXiv + Europe PMC always run. Keyed
+# engines (OpenAlex, Semantic Scholar) join only when a key is retrievable at
+# runtime via `secrets get` — never stored on disk, never logged.
+
+_SCHOLAR_UA = "wscrape/1.0 (academic federation)"
+_CROSSREF_MAILTO = "you@example.com"        # set to your email (API polite pools)
+_SECRET_OPENALEX = "openalex"          # root scope (global tool): `secrets put openalex`
+_SECRET_S2 = "semantic-scholar"        # root scope (global tool): `secrets put semantic-scholar`
+
+
+def _get_secret(name: str) -> str | None:
+    """Fetch a key via `secrets get`; None if absent/locked/denied. Never logs the value."""
+    try:
+        proc = subprocess.run(
+            ["secrets", "get", name], capture_output=True, text=True, timeout=10
+        )
+    except Exception:  # noqa: BLE001 — secrets missing or timed out → treat as no key
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() or None
+
+
+def _norm_doi(doi: str | None) -> str | None:
+    if not doi:
+        return None
+    d = doi.strip().lower()
+    d = re.sub(r"^https?://(dx\.)?doi\.org/", "", d)
+    return d or None
+
+
+def _norm_title(title: str | None) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (title or "").lower()).strip()
+
+
+def _scholar_key(rec: dict) -> str:
+    """Dedup key: DOI → arXiv id → PMID → normalised title."""
+    return (
+        _norm_doi(rec.get("doi"))
+        or (f"arxiv:{rec['arxiv_id']}" if rec.get("arxiv_id") else None)
+        or (f"pmid:{rec['pmid']}" if rec.get("pmid") else None)
+        or f"title:{_norm_title(rec.get('title'))}"
+    )
+
+
+def _merge_records(a: dict, b: dict) -> dict:
+    """Combine two records for the same item, keeping the richest fields.
+
+    Handles the common Result shape shared by scholar and news; fields absent
+    in a given vertical are simply no-ops.
+    """
+    out = dict(a)
+    out["sources"] = sorted(set(a.get("sources", [])) | set(b.get("sources", [])))
+    for f in ("doi", "url", "venue", "arxiv_id", "pmid", "year",
+              "domain", "date", "lang", "country"):
+        if not out.get(f) and b.get(f):
+            out[f] = b[f]
+    if len(b.get("authors") or []) > len(out.get("authors") or []):
+        out["authors"] = b["authors"]
+    for f in ("abstract", "snippet"):
+        if len(b.get(f) or "") > len(out.get(f) or ""):
+            out[f] = b[f]
+    out["citations"] = max(a.get("citations") or 0, b.get("citations") or 0)
+    if b.get("open_access") is True:
+        out["open_access"] = True
+    elif out.get("open_access") is None:
+        out["open_access"] = b.get("open_access")
+    return out
+
+
+def _rrf_merge(ranked_lists: list[list[dict]], key_fn=_scholar_key, k: int = 60) -> list[dict]:
+    """Reciprocal rank fusion (REQ-014/015): merge ranked lists favouring agreement.
+
+    score(d) = Σ 1/(k + rank). Rank-only, so per-engine score scales need not be
+    reconciled; an item found by several engines outranks one found by one.
+    `key_fn` is the per-vertical dedup key (DOI-based for scholar, URL for news).
+    """
+    scores: dict[str, float] = {}
+    records: dict[str, dict] = {}
+    for rlist in ranked_lists:
+        for rank, rec in enumerate(rlist, start=1):
+            key = key_fn(rec)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank)
+            records[key] = _merge_records(records[key], rec) if key in records else rec
+    return sorted(records.values(), key=lambda r: scores[key_fn(r)], reverse=True)
+
+
+async def _scholar_crossref(client, query: str, limit: int) -> list[dict]:
+    r = await client.get(
+        "https://api.crossref.org/works",
+        params={"query": query, "rows": limit, "mailto": _CROSSREF_MAILTO},
+    )
+    r.raise_for_status()
+    out = []
+    for it in r.json().get("message", {}).get("items", []):
+        parts = (it.get("issued", {}).get("date-parts") or [[None]])[0]
+        out.append({
+            "title": (it.get("title") or [""])[0],
+            "authors": [f"{a.get('given','')} {a.get('family','')}".strip()
+                        for a in it.get("author", [])],
+            "year": parts[0] if parts else None,
+            "venue": (it.get("container-title") or [""])[0],
+            "doi": it.get("DOI"),
+            "url": it.get("URL") or (f"https://doi.org/{it['DOI']}" if it.get("DOI") else ""),
+            "citations": it.get("is-referenced-by-count"),
+            "abstract": re.sub(r"<[^>]+>", "", it.get("abstract", "")).strip(),
+            "arxiv_id": None, "pmid": None, "open_access": None,
+            "sources": ["crossref"],
+        })
+    return out
+
+
+async def _scholar_arxiv(client, query: str, limit: int) -> list[dict]:
+    import xml.etree.ElementTree as ET
+
+    r = await client.get(
+        "http://export.arxiv.org/api/query",
+        params={"search_query": f"all:{query}", "start": 0,
+                "max_results": limit, "sortBy": "relevance"},
+    )
+    r.raise_for_status()
+    ns = {"a": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
+    out = []
+    for e in ET.fromstring(r.text).findall("a:entry", ns):
+        abs_url = (e.findtext("a:id", "", ns) or "").strip()
+        arxiv_id = abs_url.rsplit("/abs/", 1)[-1] if "/abs/" in abs_url else abs_url.rsplit("/", 1)[-1]
+        published = e.findtext("a:published", "", ns)
+        doi = e.findtext("arxiv:doi", None, ns)
+        out.append({
+            "title": " ".join((e.findtext("a:title", "", ns) or "").split()),
+            "authors": [n.text.strip() for n in e.findall("a:author/a:name", ns) if n.text],
+            "year": int(published[:4]) if published[:4].isdigit() else None,
+            "venue": "arXiv",
+            "doi": doi,
+            "url": abs_url,
+            "citations": None,
+            "abstract": " ".join((e.findtext("a:summary", "", ns) or "").split()),
+            "arxiv_id": arxiv_id, "pmid": None, "open_access": True,
+            "sources": ["arxiv"],
+        })
+    return out
+
+
+async def _scholar_europepmc(client, query: str, limit: int) -> list[dict]:
+    r = await client.get(
+        "https://www.ebi.ac.uk/europepmc/webservices/rest/search",
+        params={"query": query, "format": "json", "pageSize": limit, "resultType": "core"},
+    )
+    r.raise_for_status()
+    out = []
+    for it in r.json().get("resultList", {}).get("result", []):
+        out.append({
+            "title": it.get("title", "").rstrip("."),
+            "authors": [a.strip() for a in (it.get("authorString") or "").split(",") if a.strip()],
+            "year": int(it["pubYear"]) if str(it.get("pubYear", "")).isdigit() else None,
+            "venue": it.get("journalTitle") or "",
+            "doi": it.get("doi"),
+            "url": f"https://doi.org/{it['doi']}" if it.get("doi") else
+                   f"https://europepmc.org/article/{it.get('source','MED')}/{it.get('id','')}",
+            "citations": it.get("citedByCount"),
+            "abstract": (it.get("abstractText") or "").strip(),
+            "arxiv_id": None, "pmid": it.get("pmid"),
+            "open_access": it.get("isOpenAccess") == "Y",
+            "sources": ["europepmc"],
+        })
+    return out
+
+
+def _openalex_abstract(inv: dict | None) -> str:
+    if not inv:
+        return ""
+    positions = sorted((i, w) for w, idxs in inv.items() for i in idxs)
+    return " ".join(w for _, w in positions)
+
+
+async def _scholar_openalex(client, query: str, limit: int, key: str) -> list[dict]:
+    r = await client.get(
+        "https://api.openalex.org/works",
+        params={"search": query, "per-page": limit,
+                "api_key": key, "mailto": _CROSSREF_MAILTO},
+    )
+    r.raise_for_status()
+    out = []
+    for it in r.json().get("results", []):
+        loc = (it.get("primary_location") or {}).get("source") or {}
+        out.append({
+            "title": it.get("title") or it.get("display_name") or "",
+            "authors": [a["author"]["display_name"] for a in it.get("authorships", [])
+                        if a.get("author", {}).get("display_name")],
+            "year": it.get("publication_year"),
+            "venue": loc.get("display_name") or "",
+            "doi": it.get("doi"),
+            "url": it.get("doi") or it.get("id") or "",
+            "citations": it.get("cited_by_count"),
+            "abstract": _openalex_abstract(it.get("abstract_inverted_index")),
+            "arxiv_id": None, "pmid": None,
+            "open_access": (it.get("open_access") or {}).get("is_oa"),
+            "sources": ["openalex"],
+        })
+    return out
+
+
+async def _scholar_semanticscholar(client, query: str, limit: int, key: str) -> list[dict]:
+    r = await client.get(
+        "https://api.semanticscholar.org/graph/v1/paper/search",
+        params={"query": query, "limit": limit,
+                "fields": "title,authors,year,citationCount,abstract,externalIds,venue"},
+        headers={"x-api-key": key},
+    )
+    r.raise_for_status()
+    out = []
+    for it in r.json().get("data", []):
+        ext = it.get("externalIds") or {}
+        doi = ext.get("DOI")
+        out.append({
+            "title": it.get("title") or "",
+            "authors": [a.get("name") for a in it.get("authors", []) if a.get("name")],
+            "year": it.get("year"),
+            "venue": it.get("venue") or "",
+            "doi": doi,
+            "url": f"https://doi.org/{doi}" if doi else
+                   f"https://www.semanticscholar.org/paper/{it.get('paperId','')}",
+            "citations": it.get("citationCount"),
+            "abstract": (it.get("abstract") or "").strip(),
+            "arxiv_id": ext.get("ArXiv"), "pmid": ext.get("PubMed"),
+            "open_access": None,
+            "sources": ["semanticscholar"],
+        })
+    return out
+
+
+def _short_err(e: Exception) -> str:
+    import httpx
+    if isinstance(e, httpx.HTTPStatusError):
+        return f"HTTP {e.response.status_code}"
+    return type(e).__name__
+
+
+async def _do_scholar(query: str, limit: int, since_year: int | None,
+                      open_access: bool) -> tuple[list[dict], list[tuple[str, str]]]:
+    import httpx
+
+    # (name, coroutine-factory) — keyless core always runs.
+    active = [
+        ("crossref", _scholar_crossref),
+        ("arxiv", _scholar_arxiv),
+        ("europepmc", _scholar_europepmc),
+    ]
+    coverage: list[tuple[str, str]] = []
+
+    # Keyed opt-in engines (REQ-013): included only if a key is present.
+    for name, secret, fn in (
+        ("openalex", _SECRET_OPENALEX, _scholar_openalex),
+        ("semanticscholar", _SECRET_S2, _scholar_semanticscholar),
+    ):
+        key = _get_secret(secret)
+        if key:
+            active.append((name, lambda c, q, l, fn=fn, key=key: fn(c, q, l, key)))
+        else:
+            coverage.append((name, "skipped (no key)"))
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=20,
+                                 headers={"User-Agent": _SCHOLAR_UA}) as client:
+        names = [n for n, _ in active]
+        results = await asyncio.gather(
+            *(fn(client, query, limit) for _, fn in active), return_exceptions=True
+        )
+
+    ranked_lists = []
+    for name, res in zip(names, results):
+        if isinstance(res, Exception):
+            coverage.append((name, f"failed: {_short_err(res)}"))
+        else:
+            coverage.append((name, f"ok ({len(res)})"))
+            ranked_lists.append(res)
+
+    merged = _rrf_merge(ranked_lists)
+    if since_year:
+        merged = [r for r in merged if (r.get("year") or 0) >= since_year]
+    if open_access:
+        merged = [r for r in merged if r.get("open_access") is True]
+    return merged[:limit], coverage
+
+
+def _format_scholar_digest(results: list[dict], query: str) -> str:
+    if not results:
+        return f"# Scholar: {query}\n\n_No results._"
+    srcs = sorted({s for r in results for s in r.get("sources", [])})
+    lines = [f"# Scholar: {query}",
+             f"_{len(results)} results · sources: {', '.join(srcs)}_", ""]
+    for i, r in enumerate(results, 1):
+        authors = ", ".join((r.get("authors") or [])[:5])
+        if len(r.get("authors") or []) > 5:
+            authors += " et al."
+        meta = " · ".join(p for p in [
+            authors, str(r["year"]) if r.get("year") else "",
+            r.get("venue") or "",
+            f"{r['citations']} citations" if r.get("citations") else "",
+        ] if p)
+        lines.append(f"## {i}. {r.get('title','').strip()}")
+        if meta:
+            lines.append(meta)
+        idline = "  |  ".join(p for p in [
+            f"DOI: {r['doi']}" if r.get("doi") else "", r.get("url") or "",
+        ] if p)
+        if idline:
+            lines.append(idline)
+        if r.get("abstract"):
+            snippet = r["abstract"][:400].strip()
+            lines.append(f"\n> {snippet}{'…' if len(r['abstract']) > 400 else ''}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def cmd_scholar(args):
+    try:
+        results, coverage = asyncio.run(
+            _do_scholar(args.query, args.limit, args.since_year, args.open_access)
+        )
+    except Exception as e:
+        print(f"Scholar failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Coverage line to stderr so consumers can judge recall confidence.
+    print("wscrape scholar: " + "  ".join(f"{n} {s}" for n, s in coverage), file=sys.stderr)
+
+    if args.json:
+        _write_output(json.dumps(results, indent=2), args.output)
+    else:
+        _write_output(_format_scholar_digest(results, args.query), args.output)
+
+
+# ── news: federated news search ─────────────────────────────────────────────
+#
+# GDELT (keyless, open API) is the default workhorse. Google News RSS is opt-in
+# (--google-news) because its ToS is personal/non-commercial only.
+
+_GDELT_TIMESPAN = {"d": "1d", "w": "1w", "m": "1m", "y": "3m"}  # GDELT window ~3 months
+_TRACKING_PREFIXES = ("utm_", "mc_")
+_TRACKING_EXACT = {"fbclid", "gclid", "ref", "ref_src", "igshid", "spm", "cmpid"}
+
+
+def _is_tracking(key: str) -> bool:
+    k = key.lower()
+    return k in _TRACKING_EXACT or k.startswith(_TRACKING_PREFIXES)
+
+
+def _domain_of(url: str) -> str:
+    from urllib.parse import urlsplit
+    host = urlsplit(url).netloc.lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def _canonical_url(url: str) -> str:
+    """Normalise for dedup: https, drop www, strip tracking params + fragment."""
+    from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+    try:
+        s = urlsplit(url.strip())
+    except Exception:
+        return url.strip()
+    host = s.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path = s.path.rstrip("/") or "/"
+    query = urlencode([(k, v) for k, v in parse_qsl(s.query) if not _is_tracking(k)])
+    return urlunsplit(("https", host, path, query, ""))
+
+
+def _news_key(rec: dict) -> str:
+    url = rec.get("url") or ""
+    return _canonical_url(url) if url else f"title:{_norm_title(rec.get('title'))}"
+
+
+def _fmt_news_date(d: str) -> str:
+    m = re.match(r"(\d{4})(\d{2})(\d{2})", d or "")
+    return f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else (d or "")
+
+
+async def _news_gdelt(client, query: str, limit: int, timespan: str | None) -> list[dict]:
+    params = {"query": query, "mode": "artlist", "maxrecords": min(limit, 250),
+              "format": "json", "sort": "datedesc"}
+    if timespan:
+        params["timespan"] = timespan
+    r = await client.get("https://api.gdeltproject.org/api/v2/doc/doc", params=params)
+    r.raise_for_status()
+    try:
+        data = r.json()
+    except Exception:
+        raise RuntimeError("rate-limited (non-JSON)")  # GDELT throttles to ~1 req/5s
+    return [{
+        "title": a.get("title", "").strip(),
+        "url": a.get("url", ""),
+        "domain": a.get("domain", ""),
+        "date": a.get("seendate", ""),
+        "lang": a.get("language", ""),
+        "country": a.get("sourcecountry", ""),
+        "snippet": "",
+        "sources": ["gdelt"],
+    } for a in data.get("articles", [])]
+
+
+async def _news_google(client, query: str, limit: int, lang: str, country: str) -> list[dict]:
+    import xml.etree.ElementTree as ET
+
+    r = await client.get(
+        "https://news.google.com/rss/search",
+        params={"q": query, "hl": f"{lang}-{country}", "gl": country, "ceid": f"{country}:{lang}"},
+    )
+    r.raise_for_status()
+    out = []
+    for item in ET.fromstring(r.text).findall(".//item")[:limit]:
+        src = item.find("source")
+        domain = ""
+        if src is not None:
+            raw = src.get("url", "") or (src.text or "")
+            domain = _domain_of(raw) if raw.startswith("http") else raw
+        out.append({
+            "title": (item.findtext("title", "") or "").strip(),
+            "url": item.findtext("link", "") or "",
+            "domain": domain,
+            "date": item.findtext("pubDate", "") or "",
+            "lang": lang, "country": country,
+            "snippet": "",
+            "sources": ["googlenews"],
+        })
+    return out
+
+
+async def _hydrate_news(client, records: list[dict], top_n: int) -> None:
+    """Fetch top-N articles to add a snippet and resolve redirect URLs (in place).
+
+    Google News `rss/articles/…` links can't be resolved without a browser (they
+    bounce through a JS consent page), so we skip them rather than capture that
+    boilerplate — their records keep the redirect URL and no snippet.
+    """
+    import trafilatura
+
+    async def one(rec):
+        url = rec.get("url") or ""
+        if "news.google.com" in url:
+            return  # not statically resolvable — leave as-is
+        try:
+            resp = await client.get(url, headers={"User-Agent": _SCHOLAR_UA}, timeout=15)
+            resp.raise_for_status()
+            final = str(resp.url)
+            if "google.com" in _domain_of(final):
+                return  # bounced to a Google consent/interstitial page
+            text = trafilatura.extract(resp.text, favor_precision=True, include_comments=False) or ""
+            if text:
+                rec["snippet"] = " ".join(text.split())[:300]
+            rec["url"] = final
+            rec["domain"] = rec.get("domain") or _domain_of(final)
+        except Exception:
+            pass  # hydration is best-effort; leave the record as-is
+
+    await asyncio.gather(*(one(r) for r in records[:top_n]))
+
+
+async def _do_news(query: str, limit: int, recent: str | None, lang: str, country: str,
+                   use_google: bool, hydrate: bool) -> tuple[list[dict], list[tuple[str, str]]]:
+    import httpx
+
+    timespan = _GDELT_TIMESPAN.get(recent) if recent else None
+    active = [("gdelt", lambda c: _news_gdelt(c, query, limit, timespan))]
+    if use_google:
+        active.append(("googlenews", lambda c: _news_google(c, query, limit, lang, country)))
+
+    coverage: list[tuple[str, str]] = []
+    async with httpx.AsyncClient(follow_redirects=True, timeout=20,
+                                 headers={"User-Agent": _SCHOLAR_UA}) as client:
+        names = [n for n, _ in active]
+        results = await asyncio.gather(*(fn(client) for _, fn in active), return_exceptions=True)
+        ranked = []
+        for name, res in zip(names, results):
+            if isinstance(res, Exception):
+                coverage.append((name, f"failed: {_short_err(res)}"))
+            else:
+                coverage.append((name, f"ok ({len(res)})"))
+                ranked.append(res)
+        merged = _rrf_merge(ranked, key_fn=_news_key)[:limit]
+        if hydrate and merged:
+            await _hydrate_news(client, merged, min(len(merged), 10))
+    return merged, coverage
+
+
+def _format_news_digest(results: list[dict], query: str) -> str:
+    if not results:
+        return f"# News: {query}\n\n_No results._"
+    srcs = sorted({s for r in results for s in r.get("sources", [])})
+    lines = [f"# News: {query}",
+             f"_{len(results)} articles · sources: {', '.join(srcs)}_", ""]
+    for i, r in enumerate(results, 1):
+        meta = " · ".join(p for p in [r.get("domain", ""), _fmt_news_date(r.get("date", ""))] if p)
+        lines.append(f"## {i}. {r.get('title', '').strip()}")
+        if meta:
+            lines.append(meta)
+        if r.get("url"):
+            lines.append(r["url"])
+        if r.get("snippet"):
+            lines.append(f"\n> {r['snippet']}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def cmd_news(args):
+    try:
+        results, coverage = asyncio.run(_do_news(
+            args.query, args.limit, args.recent, args.lang, args.country,
+            args.google_news, args.hydrate,
+        ))
+    except Exception as e:
+        print(f"News failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.google_news:
+        print("wscrape news: Google News RSS is licensed for personal, non-commercial "
+              "use only — do not redistribute results.", file=sys.stderr)
+    print("wscrape news: " + "  ".join(f"{n} {s}" for n, s in coverage), file=sys.stderr)
+
+    if args.json:
+        _write_output(json.dumps(results, indent=2), args.output)
+    else:
+        _write_output(_format_news_digest(results, args.query), args.output)
 
 
 _REDDIT_HEADERS = {"User-Agent": "wscrape/1.0 (personal CLI tool)"}

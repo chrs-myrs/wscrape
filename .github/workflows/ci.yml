@@ -11,4 +11,6 @@ jobs:
         # Network/live tests are excluded here to keep CI deterministic.
         run: |
           uv run --with pytest pytest tests/ -v \
-            -k "choose_markdown or build_markdown or vtt_parsing or url_parsing"
+            -k "choose_markdown or build_markdown or vtt_parsing or url_parsing \
+                or norm_doi or scholar_key or merge_records or rrf_merge \
+                or canonical_url or is_tracking or domain_of or news_key"

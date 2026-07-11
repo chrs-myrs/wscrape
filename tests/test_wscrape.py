@@ -41,6 +41,16 @@ def test_unknown_command_fails():
     assert result.returncode != 0
 
 
+def test_repair_title_respaces_query_terms_only():
+    """ddgs strips spaces around highlighted query terms; we re-insert them."""
+    w = _load_cli()
+    q = "Tower Hamlets festivals"
+    assert w._repair_title("TowerHamletsTown Hall | TikTok", q) == "Tower Hamlets Town Hall | TikTok"
+    assert w._repair_title("attendTowerHamletsfestivalswith", q) == "attend Tower Hamlets festivals with"
+    # Brand casing that isn't a query term must be left untouched.
+    assert w._repair_title("TikTok GitHub iPhone", q) == "TikTok GitHub iPhone"
+
+
 def test_search_returns_json_results():
     result = run(["search", "python web scraping", "--limit", "3"])
     assert result.returncode == 0, result.stderr
@@ -49,6 +59,8 @@ def test_search_returns_json_results():
     assert len(data) > 0
     assert "url" in data[0]
     assert "title" in data[0]
+    # Backend fallback should yield usable snippet bodies for triage.
+    assert any(r.get("snippet") for r in data)
 
 
 def test_search_writes_to_file(tmp_path):
@@ -207,6 +219,115 @@ def test_gather_returns_digest_and_json():
     assert as_json.returncode == 0, as_json.stderr
     data = json.loads(as_json.stdout)
     assert isinstance(data, list)
+
+
+def test_norm_doi_strips_prefix_and_lowercases():
+    w = _load_cli()
+    assert w._norm_doi("https://doi.org/10.1/ABC") == "10.1/abc"
+    assert w._norm_doi("http://dx.doi.org/10.1/ABC") == "10.1/abc"
+    assert w._norm_doi("10.1/ABC") == "10.1/abc"
+    assert w._norm_doi(None) is None
+    assert w._norm_doi("") is None
+
+
+def test_scholar_key_precedence():
+    """Dedup key falls through DOI → arXiv id → PMID → normalised title."""
+    w = _load_cli()
+    assert w._scholar_key({"doi": "https://doi.org/10.1/X"}) == "10.1/x"
+    assert w._scholar_key({"doi": None, "arxiv_id": "2306.1"}) == "arxiv:2306.1"
+    assert w._scholar_key({"arxiv_id": None, "pmid": "999"}) == "pmid:999"
+    assert w._scholar_key({"title": "Deep Learning!"}) == "title:deep learning"
+
+
+def test_merge_records_unions_sources_and_keeps_richest():
+    w = _load_cli()
+    a = {"title": "T", "sources": ["crossref"], "citations": 2, "authors": ["A"],
+         "abstract": "short", "venue": "", "open_access": None}
+    b = {"title": "T", "sources": ["arxiv"], "citations": 10, "authors": ["A", "B"],
+         "abstract": "a much longer abstract", "venue": "arXiv", "open_access": True}
+    m = w._merge_records(a, b)
+    assert m["sources"] == ["arxiv", "crossref"]      # union, sorted
+    assert m["citations"] == 10                        # max
+    assert m["authors"] == ["A", "B"]                  # longer author list
+    assert m["abstract"] == "a much longer abstract"   # longer abstract
+    assert m["venue"] == "arXiv"                        # fill empty field
+    assert m["open_access"] is True
+
+
+def test_rrf_merge_rewards_cross_engine_agreement():
+    """A work found by two engines outranks works found by one (RRF)."""
+    w = _load_cli()
+    list1 = [{"doi": "10/y"}, {"doi": "10/x"}]   # y@1, x@2
+    list2 = [{"doi": "10/x"}, {"doi": "10/z"}]   # x@1, z@2
+    merged = w._rrf_merge([list1, list2])
+    assert [r["doi"] for r in merged] == ["10/x", "10/y", "10/z"]
+    assert len(merged) == 3
+
+
+def test_scholar_federates_keyless():
+    """Live: scholar federates the keyless core and reports coverage on stderr."""
+    result = run(["scholar", "transformer neural networks", "--limit", "5"], timeout=90)
+    assert result.returncode == 0, result.stderr
+    assert "# Scholar:" in result.stdout
+    # Coverage line names the engines queried; keyless core must appear.
+    assert "wscrape scholar:" in result.stderr
+    assert "crossref" in result.stderr and "arxiv" in result.stderr
+
+
+def test_scholar_json_shape():
+    """Live: --json emits records with the common Result schema."""
+    result = run(["scholar", "CRISPR gene editing", "--limit", "3", "--json"], timeout=90)
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert isinstance(data, list) and len(data) >= 1
+    for key in ("title", "doi", "url", "citations", "sources"):
+        assert key in data[0]
+    assert isinstance(data[0]["sources"], list)
+
+
+def test_canonical_url_normalises():
+    w = _load_cli()
+    assert (w._canonical_url("http://www.Example.com/path/?utm_source=x&id=5#frag")
+            == "https://example.com/path?id=5")
+    assert w._canonical_url("https://example.com/") == "https://example.com/"
+    assert w._canonical_url("https://example.com/a/") == "https://example.com/a"
+
+
+def test_is_tracking_param():
+    w = _load_cli()
+    assert w._is_tracking("utm_source") and w._is_tracking("fbclid") and w._is_tracking("gclid")
+    assert not w._is_tracking("id") and not w._is_tracking("q")
+
+
+def test_domain_of_strips_www():
+    w = _load_cli()
+    assert w._domain_of("https://www.bbc.co.uk/news") == "bbc.co.uk"
+    assert w._domain_of("https://forbes.com/x") == "forbes.com"
+
+
+def test_news_key_canonical_then_title():
+    w = _load_cli()
+    assert w._news_key({"url": "http://www.x.com/a/?utm_source=y"}) == "https://x.com/a"
+    assert w._news_key({"url": "", "title": "Big News!"}) == "title:big news"
+
+
+def test_rrf_merge_accepts_custom_key_fn():
+    """News dedups by canonical URL: the same article from two engines fuses."""
+    w = _load_cli()
+    l1 = [{"url": "https://a.com/1"}, {"url": "https://b.com/2"}]
+    l2 = [{"url": "http://www.a.com/1/"}, {"url": "https://c.com/3"}]  # a.com/1 dup
+    merged = w._rrf_merge([l1, l2], key_fn=w._news_key)
+    assert w._news_key(merged[0]) == "https://a.com/1"  # found in both → top
+    assert len(merged) == 3
+
+
+def test_news_gdelt_federates():
+    """Live: news queries GDELT and reports coverage (tolerant of GDELT 429s)."""
+    result = run(["news", "climate policy", "--limit", "3"], timeout=90)
+    assert result.returncode == 0, result.stderr
+    assert "# News:" in result.stdout
+    # Coverage line names the engine whether it returned data or was rate-limited.
+    assert "gdelt" in result.stderr
 
 
 def test_reddit_url_parsing():

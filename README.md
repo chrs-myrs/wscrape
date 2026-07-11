@@ -34,6 +34,8 @@ confidence-rated findings with the raw evidence preserved.
 | `wscrape map` | Discover URLs on a site (page links, or `--seed sitemap|cc` for sitemap / Common Crawl). |
 | `wscrape crawl` | Bulk-crawl a section (native deep-crawl; `--keywords` to walk toward relevant pages). |
 | `wscrape gather` | Adaptively crawl from a start URL until it has enough to answer a `--query`. |
+| `wscrape scholar` | Search academic literature — federates Crossref, arXiv, and Europe PMC (keyless), rank-fused and DOI-deduplicated. |
+| `wscrape news` | Search news — GDELT by default (keyless, global); optional Google News; `--hydrate` for snippets. |
 | `wscrape reddit` | Search Reddit discussions (via DuckDuckGo — works from any IP). |
 | `wscrape transcript` | Extract a YouTube video transcript via yt-dlp. |
 
