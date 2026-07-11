@@ -1,0 +1,670 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = "==3.11.*"
+# dependencies = [
+#   "crawl4ai>=0.9,<0.10",
+#   "ddgs>=9",
+#   "httpx>=0.27",
+#   "trafilatura>=1.12",
+# ]
+# ///
+
+import asyncio
+import argparse
+import json
+import re
+import subprocess
+import sys
+import tempfile
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def _write_output(content: str, path: str | None):
+    if path:
+        out = Path(path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(content, encoding="utf-8")
+    else:
+        print(content)
+
+
+@contextmanager
+def _quiet_crawl4ai():
+    """Suppress crawl4ai Rich progress output that goes to stdout."""
+    import logging
+    logger = logging.getLogger("crawl4ai")
+    old_level = logger.level
+    logger.setLevel(logging.CRITICAL)
+    old_stdout = sys.stdout
+    sys.stdout = sys.stderr  # belt-and-suspenders: Rich bypasses logging in some versions
+    try:
+        yield
+    finally:
+        sys.stdout = old_stdout
+        logger.setLevel(old_level)
+
+
+def _add_fetch_flags(p):
+    """Shared cache + robots flags for crawl4ai-backed subcommands."""
+    cache = p.add_mutually_exclusive_group()
+    cache.add_argument("--fresh", action="store_true", help="Bypass cache, always fetch (default)")
+    cache.add_argument("--cache", action="store_true", help="Use cache for speed on repeat fetches")
+    p.add_argument("--robots", action="store_true", help="Respect robots.txt")
+
+
+def _want_cache(args) -> bool:
+    """Whether to use the crawl4ai cache. Default: fresh (no cache)."""
+    return getattr(args, "cache", False)
+
+
+def _resolve_cache_mode(use_cache: bool):
+    """Map the cache flag to a crawl4ai CacheMode (import kept local)."""
+    from crawl4ai import CacheMode
+    return CacheMode.ENABLED if use_cache else CacheMode.BYPASS
+
+
+# Fall back to raw markdown when the fitted extract collapses below this
+# fraction of the raw length (or is empty) — guards against over-pruning.
+_FIT_MIN_RATIO = 0.30
+
+
+def _choose_markdown(fit: str, raw: str, want_raw: bool, ratio_check: bool = True) -> tuple[str, bool]:
+    """Pick between fitted and raw markdown. Returns (chosen, fell_back).
+
+    ratio_check=False (query/BM25 mode) only falls back on empty fit, since a
+    query filter legitimately narrows content below the length ratio.
+    """
+    if want_raw:
+        return raw, False
+    if not fit.strip():
+        return raw, True
+    if ratio_check and len(fit) < _FIT_MIN_RATIO * len(raw):
+        return raw, True
+    return fit, False
+
+
+def _build_markdown_generator(want_raw: bool, query: str | None):
+    """Build the crawl4ai markdown generator: raw (None), BM25 (query), or pruning."""
+    if want_raw:
+        return None
+    from crawl4ai.content_filter_strategy import BM25ContentFilter, PruningContentFilter
+    from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
+
+    if query:
+        content_filter = BM25ContentFilter(user_query=query)
+    else:
+        content_filter = PruningContentFilter(
+            threshold=0.48, threshold_type="dynamic", min_word_threshold=5
+        )
+    return DefaultMarkdownGenerator(content_filter=content_filter)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="wscrape", description="Web scraping CLI")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_search = sub.add_parser("search", help="Web search via DuckDuckGo")
+    p_search.add_argument("query")
+    p_search.add_argument("--limit", type=int, default=10)
+    p_search.add_argument("-o", "--output", help="Write output to file")
+
+    p_scrape = sub.add_parser("scrape", help="Extract content from a URL")
+    p_scrape.add_argument("url")
+    p_scrape.add_argument("--js", action="store_true", help="Force Playwright (skip static attempt)")
+    p_scrape.add_argument("--raw", action="store_true", help="Return full page content instead of boilerplate-stripped")
+    p_scrape.add_argument("--query", help="Return passages relevant to this query (BM25; forces JS path)")
+    _add_fetch_flags(p_scrape)
+    p_scrape.add_argument("-o", "--output")
+
+    p_map = sub.add_parser("map", help="Discover URLs on a site")
+    p_map.add_argument("url")
+    p_map.add_argument("--search", help="Filter URLs containing this string")
+    p_map.add_argument("--seed", choices=["sitemap", "cc", "sitemap+cc"],
+                       help="Discover URLs via sitemap and/or Common Crawl instead of page links")
+    p_map.add_argument("--limit", type=int, default=200)
+    _add_fetch_flags(p_map)
+    p_map.add_argument("-o", "--output")
+
+    p_crawl = sub.add_parser("crawl", help="Bulk crawl a site section")
+    p_crawl.add_argument("url")
+    p_crawl.add_argument("--limit", type=int, default=50)
+    p_crawl.add_argument("--depth", type=int, default=3)
+    p_crawl.add_argument("--include", help="Comma-separated path prefixes to include")
+    p_crawl.add_argument("--keywords", help="Comma-separated keywords to crawl toward (relevance-scored)")
+    p_crawl.add_argument("--query", help="Return passages relevant to this query (BM25 content filter)")
+    p_crawl.add_argument("--raw", action="store_true", help="Return full page content instead of boilerplate-stripped")
+    _add_fetch_flags(p_crawl)
+    p_crawl.add_argument("-o", "--output")
+
+    p_gather = sub.add_parser("gather", help="Adaptively crawl until a query is answered")
+    p_gather.add_argument("url")
+    p_gather.add_argument("--query", required=True, help="Question/topic to gather enough content to answer")
+    p_gather.add_argument("--limit", type=int, default=20, help="Max pages to crawl")
+    p_gather.add_argument("--confidence", type=float, default=0.7, help="Stop when confidence reaches this (0-1)")
+    p_gather.add_argument("--json", action="store_true", help="Output structured JSON instead of a markdown digest")
+    p_gather.add_argument("-o", "--output")
+
+    p_reddit = sub.add_parser("reddit", help="Fetch Reddit content via API")
+    p_reddit.add_argument("target", help="Reddit URL or search query")
+    p_reddit.add_argument("--search", action="store_true", help="Search Reddit instead of fetching URL")
+    p_reddit.add_argument("--subreddit", help="Limit search to subreddit")
+    p_reddit.add_argument("--comments", type=int, default=10, help="Max comments per post")
+    p_reddit.add_argument("--limit", type=int, default=10, help="Max results for search/listing")
+    p_reddit.add_argument("-o", "--output")
+
+    p_transcript = sub.add_parser("transcript", help="Extract YouTube transcript via yt-dlp")
+    p_transcript.add_argument("url", help="YouTube URL or video ID")
+    p_transcript.add_argument("--lang", default="en", help="Subtitle language (default: en)")
+    p_transcript.add_argument("-o", "--output")
+
+    args = parser.parse_args()
+
+    dispatch = {
+        "search": cmd_search,
+        "scrape": cmd_scrape,
+        "map": cmd_map,
+        "crawl": cmd_crawl,
+        "gather": cmd_gather,
+        "reddit": cmd_reddit,
+        "transcript": cmd_transcript,
+    }
+    dispatch[args.command](args)
+
+
+def cmd_search(args):
+    import io
+    from ddgs import DDGS
+
+    try:
+        old_stderr = sys.stderr
+        sys.stderr = io.StringIO()
+        try:
+            ddgs = DDGS()
+            raw = list(ddgs.text(args.query, max_results=args.limit))
+        finally:
+            sys.stderr = old_stderr
+    except Exception as e:
+        print(f"Search failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    results = [
+        {
+            "title": r.get("title", ""),
+            "url": r.get("href", ""),
+            "snippet": r.get("body", ""),
+        }
+        for r in raw
+    ]
+    _write_output(json.dumps(results, indent=2), args.output)
+
+
+async def _scrape_static(url: str, want_raw: bool) -> str:
+    import httpx
+    import trafilatura
+
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; wscrape/1.0)"}
+    async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
+        resp = await client.get(url, headers=headers)
+        resp.raise_for_status()
+        html = resp.text
+
+    extracted = trafilatura.extract(
+        html,
+        include_comments=want_raw,
+        include_tables=True,
+        favor_precision=not want_raw,
+        output_format="markdown",
+    )
+    return extracted or ""
+
+
+async def _scrape_js(url: str, want_raw: bool, query: str | None, use_cache: bool, robots: bool) -> str:
+    from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+
+    config = CrawlerRunConfig(
+        word_count_threshold=5,
+        markdown_generator=_build_markdown_generator(want_raw, query),
+        cache_mode=_resolve_cache_mode(use_cache),
+        check_robots_txt=robots,
+    )
+    async with AsyncWebCrawler(config=BrowserConfig(verbose=False)) as crawler:
+        result = await crawler.arun(url=url, config=config)
+        if not result.markdown:
+            return ""
+        raw = result.markdown.raw_markdown or ""
+        fit = result.markdown.fit_markdown or ""
+        chosen, fell_back = _choose_markdown(fit, raw, want_raw, ratio_check=not query)
+        if fell_back:
+            pct = int(100 * len(fit) / len(raw)) if raw else 0
+            print(
+                f"wscrape: fit_markdown too sparse ({pct}% of raw) — "
+                f"falling back to raw for {url}",
+                file=sys.stderr,
+            )
+        return chosen
+
+
+async def _do_scrape(url: str, force_js: bool, want_raw: bool, query: str | None,
+                     use_cache: bool, robots: bool) -> str:
+    # A query needs rendered content for BM25, so it forces the crawl4ai path.
+    if not force_js and not query:
+        try:
+            content = await _scrape_static(url, want_raw)
+            if len(content.strip()) >= 200:
+                return content
+        except Exception:
+            pass  # Fall through to Playwright
+    return await _scrape_js(url, want_raw, query, use_cache, robots)
+
+
+def cmd_scrape(args):
+    try:
+        with _quiet_crawl4ai():
+            content = asyncio.run(
+                _do_scrape(args.url, args.js, args.raw, args.query, _want_cache(args), args.robots)
+            )
+    except Exception as e:
+        print(f"Scrape failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    _write_output(content, args.output)
+
+
+async def _do_map(url: str, search: str | None, limit: int, use_cache: bool, robots: bool) -> list[str]:
+    from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+
+    config = CrawlerRunConfig(cache_mode=_resolve_cache_mode(use_cache), check_robots_txt=robots)
+    async with AsyncWebCrawler(config=BrowserConfig(verbose=False)) as crawler:
+        result = await crawler.arun(url=url, config=config)
+        internal = result.links.get("internal") or []
+        links = [l["href"] for l in internal if l.get("href", "").startswith("http")]
+
+    if search:
+        links = [l for l in links if search.lower() in l.lower()]
+
+    # Deduplicate preserving order
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for l in links:
+        if l not in seen:
+            seen.add(l)
+            deduped.append(l)
+
+    return deduped[:limit]
+
+
+async def _do_map_seed(url: str, source: str, search: str | None, limit: int) -> list[str]:
+    """Discover URLs via sitemap and/or Common Crawl (AsyncUrlSeeder)."""
+    from urllib.parse import urlparse
+    from crawl4ai import AsyncUrlSeeder, SeedingConfig
+
+    domain = urlparse(url).netloc or url
+    config = SeedingConfig(
+        source=source,
+        extract_head=False,
+        pattern=(f"*{search}*" if search else "*"),
+        max_urls=limit,
+    )
+    async with AsyncUrlSeeder() as seeder:
+        seeds = await seeder.urls(domain, config)
+    return [s["url"] for s in seeds][:limit]
+
+
+def cmd_map(args):
+    try:
+        with _quiet_crawl4ai():
+            if args.seed:
+                urls = asyncio.run(
+                    _do_map_seed(args.url, args.seed, args.search, args.limit)
+                )
+            else:
+                urls = asyncio.run(
+                    _do_map(args.url, args.search, args.limit, _want_cache(args), args.robots)
+                )
+    except Exception as e:
+        print(f"Map failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    _write_output("\n".join(urls), args.output)
+
+
+def _build_deep_crawl_strategy(limit, max_depth, include_paths, keywords):
+    """BestFirst (relevance-scored) when keywords given, else plain BFS."""
+    from crawl4ai.deep_crawling import BestFirstCrawlingStrategy, BFSDeepCrawlStrategy
+    from crawl4ai.deep_crawling.filters import ContentTypeFilter, FilterChain, URLPatternFilter
+    from crawl4ai.deep_crawling.scorers import KeywordRelevanceScorer
+
+    filters = [ContentTypeFilter(allowed_types=["text/html"])]
+    if include_paths:
+        filters.insert(0, URLPatternFilter(patterns=[f"*{p}*" for p in include_paths]))
+    filter_chain = FilterChain(filters)
+
+    if keywords:
+        return BestFirstCrawlingStrategy(
+            max_depth=max_depth, include_external=False, max_pages=limit,
+            url_scorer=KeywordRelevanceScorer(keywords=keywords, weight=0.7),
+            filter_chain=filter_chain,
+        )
+    return BFSDeepCrawlStrategy(
+        max_depth=max_depth, include_external=False, max_pages=limit,
+        filter_chain=filter_chain,
+    )
+
+
+async def _do_crawl(
+    url: str, limit: int, max_depth: int, include_paths: list[str], keywords: list[str],
+    want_raw: bool, query: str | None, use_cache: bool, robots: bool,
+) -> list[dict]:
+    """Crawl a site section using crawl4ai's native deep-crawl strategy."""
+    from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+
+    run_config = CrawlerRunConfig(
+        deep_crawl_strategy=_build_deep_crawl_strategy(limit, max_depth, include_paths, keywords),
+        markdown_generator=_build_markdown_generator(want_raw, query),
+        cache_mode=_resolve_cache_mode(use_cache),
+        check_robots_txt=robots,
+    )
+
+    results: list[dict] = []
+    async with AsyncWebCrawler(config=BrowserConfig(verbose=False)) as crawler:
+        container = await crawler.arun(url=url, config=run_config)
+        pages = container if isinstance(container, list) else list(container)
+        for result in pages:
+            if not getattr(result, "success", False):
+                continue
+            raw = result.markdown.raw_markdown or "" if result.markdown else ""
+            fit = result.markdown.fit_markdown or "" if result.markdown else ""
+            chosen, _ = _choose_markdown(fit, raw, want_raw, ratio_check=not query)
+            results.append({"url": result.url, "markdown": chosen})
+            if len(results) >= limit:
+                break
+
+    return results[:limit]
+
+
+def cmd_crawl(args):
+    include = [p.strip() for p in args.include.split(",")] if args.include else []
+    keywords = [k.strip() for k in args.keywords.split(",")] if args.keywords else []
+    try:
+        with _quiet_crawl4ai():
+            results = asyncio.run(
+                _do_crawl(
+                    args.url, args.limit, args.depth, include, keywords,
+                    args.raw, args.query, _want_cache(args), args.robots,
+                )
+            )
+    except Exception as e:
+        print(f"Crawl failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    _write_output(json.dumps(results, indent=2), args.output)
+
+
+async def _do_gather(url: str, query: str, max_pages: int, confidence: float) -> list[dict]:
+    """Adaptively crawl from a start URL until the query is answered."""
+    from crawl4ai import AdaptiveConfig, AdaptiveCrawler, AsyncWebCrawler, BrowserConfig
+
+    async with AsyncWebCrawler(config=BrowserConfig(verbose=False)) as crawler:
+        adaptive = AdaptiveCrawler(
+            crawler,
+            AdaptiveConfig(
+                confidence_threshold=confidence, max_pages=max_pages, strategy="statistical"
+            ),
+        )
+        await adaptive.digest(start_url=url, query=query)
+        return adaptive.get_relevant_content(top_k=max_pages)
+
+
+def _format_gather_digest(pages: list[dict], query: str) -> str:
+    lines = [f"# Gather: {query}", ""]
+    for page in pages:
+        score = page.get("score", 0.0)
+        lines.append(f"## {page.get('url', '')} (score: {score:.2f})")
+        lines.append("")
+        lines.append(str(page.get("content", "")).strip())
+        lines.append("")
+    if len(lines) <= 2:
+        lines.append("_No relevant content gathered._")
+    return "\n".join(lines)
+
+
+def cmd_gather(args):
+    try:
+        with _quiet_crawl4ai():
+            pages = asyncio.run(
+                _do_gather(args.url, args.query, args.limit, args.confidence)
+            )
+    except Exception as e:
+        print(f"Gather failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    if args.json:
+        _write_output(json.dumps(pages, indent=2), args.output)
+    else:
+        _write_output(_format_gather_digest(pages, args.query), args.output)
+
+
+_REDDIT_HEADERS = {"User-Agent": "wscrape/1.0 (personal CLI tool)"}
+
+_REDDIT_URL = re.compile(
+    r"https?://(?:www\.|old\.)?reddit\.com"
+    r"(?:/r/(?P<sub>[^/]+)(?:/comments/(?P<post_id>[^/]+))?)?",
+)
+
+
+def _parse_reddit_url(url: str) -> dict | None:
+    m = _REDDIT_URL.match(url)
+    if not m:
+        return None
+    return {
+        "subreddit": m.group("sub"),
+        "post_id": m.group("post_id"),
+    }
+
+
+async def _reddit_get(url: str) -> dict | list:
+    import httpx
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
+        resp = await client.get(url, headers=_REDDIT_HEADERS)
+        resp.raise_for_status()
+        return resp.json()
+
+
+def _format_post(data: list, max_comments: int) -> str:
+    post = data[0]["data"]["children"][0]["data"]
+    ts = datetime.fromtimestamp(post["created_utc"], tz=timezone.utc).strftime("%Y-%m-%d")
+    lines = [
+        f"# {post['title']}",
+        f"**r/{post['subreddit']}** | u/{post['author']} | {post['score']} points | {ts}",
+        "",
+    ]
+    if post.get("is_self") and post.get("selftext"):
+        lines.append(post["selftext"])
+    elif post.get("url"):
+        lines.append(f"Link: {post['url']}")
+    lines.append("")
+
+    comments_data = data[1]["data"]["children"]
+    comments = [c for c in comments_data if c["kind"] == "t1"][:max_comments]
+    if comments:
+        lines.append(f"## Comments (top {len(comments)})")
+        lines.append("")
+        for c in comments:
+            cd = c["data"]
+            lines.append(f"### u/{cd['author']} ({cd['score']} points)")
+            lines.append("")
+            lines.append(cd["body"])
+            lines.append("")
+    return "\n".join(lines)
+
+
+def _format_listing(data: dict, subreddit_name: str) -> str:
+    posts = data["data"]["children"]
+    lines = [f"# r/{subreddit_name}", ""]
+    for i, p in enumerate(posts, 1):
+        d = p["data"]
+        snippet = ""
+        if d.get("is_self") and d.get("selftext"):
+            snippet = d["selftext"][:120].replace("\n", " ")
+            if len(d.get("selftext", "")) > 120:
+                snippet += "..."
+        elif d.get("url"):
+            snippet = d["url"]
+        lines.append(f"{i}. **{d['title']}** ({d['score']}) — u/{d['author']}")
+        if snippet:
+            lines.append(f"   {snippet}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _reddit_search_ddg(query: str, subreddit: str | None, limit: int) -> str:
+    """Search Reddit via DuckDuckGo.
+
+    Reddit blocks unauthenticated .json endpoints from data-center IPs, so
+    search is routed through DuckDuckGo with a site: filter instead.
+    """
+    import io
+    from urllib.parse import urlsplit
+    from ddgs import DDGS
+
+    site = f"site:reddit.com/r/{subreddit}" if subreddit else "site:reddit.com"
+    full_query = f"{site} {query}"
+
+    old_stderr = sys.stderr
+    sys.stderr = io.StringIO()
+    try:
+        ddgs = DDGS()
+        # Over-fetch: DuckDuckGo injects ads/non-matching results that ignore
+        # the site: filter, so we fetch extra and keep only reddit.com hosts.
+        raw = list(ddgs.text(full_query, max_results=limit * 3))
+    finally:
+        sys.stderr = old_stderr
+
+    def _is_reddit(url: str) -> bool:
+        host = urlsplit(url).netloc.lower()
+        return host == "reddit.com" or host.endswith(".reddit.com")
+
+    raw = [r for r in raw if _is_reddit(r.get("href", "") or "")][:limit]
+
+    lines = ["# Reddit Search Results", f"_via DuckDuckGo: `{full_query}`_", ""]
+    for i, r in enumerate(raw, 1):
+        snippet = (r.get("body", "") or "")[:200].replace("\n", " ")
+        lines.append(f"{i}. **{r.get('title', '')}**")
+        if snippet:
+            lines.append(f"   {snippet}")
+        lines.append(f"   {r.get('href', '')}")
+        lines.append("")
+    if not raw:
+        lines.append("_No results._")
+    return "\n".join(lines)
+
+
+def cmd_reddit(args):
+    try:
+        if args.search:
+            content = _reddit_search_ddg(args.target, args.subreddit, args.limit)
+        else:
+            parsed = _parse_reddit_url(args.target)
+            if parsed and parsed["post_id"]:
+                url = f"https://www.reddit.com/r/{parsed['subreddit']}/comments/{parsed['post_id']}.json"
+                data = asyncio.run(_reddit_get(url))
+                content = _format_post(data, args.comments)
+            elif parsed and parsed["subreddit"]:
+                url = f"https://www.reddit.com/r/{parsed['subreddit']}/hot.json?limit={args.limit}"
+                data = asyncio.run(_reddit_get(url))
+                content = _format_listing(data, parsed["subreddit"])
+            else:
+                content = _reddit_search_ddg(args.target, args.subreddit, args.limit)
+    except Exception as e:
+        if "403" in str(e):
+            print(
+                "Reddit URL fetch blocked (403) — Reddit blocks its .json endpoints "
+                "from data-centre IPs. Use search instead, which works from any IP:\n"
+                f'  wscrape reddit "{args.target}" --search',
+                file=sys.stderr,
+            )
+        else:
+            print(f"Reddit failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    _write_output(content, args.output)
+
+
+def _parse_vtt(path: Path) -> str:
+    """Parse VTT file to clean text, stripping timestamps and deduplicating."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    text_lines: list[str] = []
+    prev = ""
+    for line in lines:
+        line = line.strip()
+        # Skip VTT header and metadata
+        if line.startswith("WEBVTT") or line.startswith("Kind:") or line.startswith("Language:"):
+            continue
+        # Skip sequence numbers
+        if re.match(r"^\d+$", line):
+            continue
+        # Skip timestamps
+        if re.match(r"\d{2}:\d{2}:\d{2}", line):
+            continue
+        # Skip blank lines
+        if not line:
+            continue
+        # Strip HTML/VTT tags
+        clean = re.sub(r"<[^>]+>", "", line)
+        if not clean:
+            continue
+        # Deduplicate consecutive lines
+        if clean != prev:
+            text_lines.append(clean)
+            prev = clean
+    return "\n".join(text_lines)
+
+
+def cmd_transcript(args):
+    if not _which("yt-dlp"):
+        print("yt-dlp not found — install with: bash tools/setup-yt-dlp.sh", file=sys.stderr)
+        sys.exit(1)
+
+    url = args.url
+    if re.match(r"^[\w-]{11}$", url):
+        url = f"https://www.youtube.com/watch?v={url}"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base_cmd = [
+            "yt-dlp",
+            "--skip-download",
+            "--sub-lang", f"{args.lang}.*",
+            "-o", f"{tmpdir}/%(id)s.%(ext)s",
+            url,
+        ]
+
+        # Try human subs first
+        subprocess.run(
+            base_cmd + ["--write-subs"],
+            capture_output=True, text=True,
+        )
+        vtt_files = list(Path(tmpdir).glob("*.vtt"))
+
+        # Fall back to auto-generated
+        if not vtt_files:
+            subprocess.run(
+                base_cmd + ["--write-auto-subs"],
+                capture_output=True, text=True,
+            )
+            vtt_files = list(Path(tmpdir).glob("*.vtt"))
+
+        if not vtt_files:
+            print("No subtitles available for this video", file=sys.stderr)
+            sys.exit(1)
+
+        content = _parse_vtt(vtt_files[0])
+
+    _write_output(content, args.output)
+
+
+def _which(cmd: str) -> bool:
+    from shutil import which
+    return which(cmd) is not None
+
+
+if __name__ == "__main__":
+    main()

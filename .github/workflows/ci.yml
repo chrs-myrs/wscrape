@@ -1,0 +1,14 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+      - name: Run offline unit tests
+        # Network/live tests are excluded here to keep CI deterministic.
+        run: |
+          uv run --with pytest pytest tests/ -v \
+            -k "choose_markdown or build_markdown or vtt_parsing or url_parsing"
