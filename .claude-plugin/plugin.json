@@ -1,6 +1,6 @@
 {
   "name": "wscrape",
-  "version": "0.1.0",
-  "description": "Self-hosted web research toolkit for Claude Code: the wscrape CLI plus research and research-brief skills. Fork it, add your own subcommands and skills, and maintain your own custom research tools.",
+  "version": "0.2.0",
+  "description": "Self-hosted web research toolkit for Claude Code: the wscrape CLI plus hunt, research, and research-brief skills. Fork it, add your own subcommands and skills, and maintain your own custom research tools.",
   "keywords": ["research", "web-scraping", "wscrape", "crawl4ai"]
 }

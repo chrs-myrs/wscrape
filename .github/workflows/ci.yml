@@ -13,4 +13,9 @@ jobs:
           uv run --with pytest pytest tests/ -v \
             -k "choose_markdown or build_markdown or vtt_parsing or url_parsing \
                 or norm_doi or scholar_key or merge_records or rrf_merge \
-                or canonical_url or is_tracking or domain_of or news_key"
+                or canonical_url or is_tracking or domain_of or news_key \
+                or parse_instances or longtail_merge_key or hn_record or strip_html \
+                or cdx_params or ledger_record or canary_stamping \
+                or rejects_unknown_engine or registers_greylit or looks_like_pdf \
+                or parse_cdx_response or cc_base or warc_pointers or fetch_rejected \
+                or dblp_mapping or openaire_mapping or ntrs_mapping or osf_mapping"

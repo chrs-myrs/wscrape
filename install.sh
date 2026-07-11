@@ -7,7 +7,7 @@ REPO="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$HOME/.local/bin" "$HOME/.claude/skills"
 
 ln -sfn "$REPO/tools/wscrape" "$HOME/.local/bin/wscrape"
-for skill in wscrape research research-brief; do
+for skill in wscrape hunt research research-brief; do
   ln -sfn "$REPO/skills/$skill" "$HOME/.claude/skills/$skill"
 done
 

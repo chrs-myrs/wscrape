@@ -5,6 +5,9 @@
 #   "crawl4ai>=0.9,<0.10",
 #   "ddgs>=9",
 #   "httpx>=0.27",
+#   # pypdf: small, pure-Python PDF text extraction for the `scrape` PDF path.
+#   # trafilatura handles HTML only; a PDF target would otherwise fail/garble.
+#   "pypdf>=4",
 #   "trafilatura>=1.12",
 # ]
 # ///
@@ -19,6 +22,8 @@ import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+
+__version__ = "1.1.0"
 
 
 def _write_output(content: str, path: str | None):
@@ -178,6 +183,45 @@ def main():
     p_news.add_argument("--json", action="store_true", help="Output structured JSON instead of a digest")
     p_news.add_argument("-o", "--output")
 
+    p_longtail = sub.add_parser("longtail", help="Federated keyless search of the small web/communities")
+    p_longtail.add_argument("query")
+    p_longtail.add_argument("--limit", type=int, default=10, help="Max merged results")
+    p_longtail.add_argument("--engines", help="Comma-separated subset: marginalia,discourse,hn (default all)")
+    p_longtail.add_argument("--instances", help="Discourse instances (comma-separated) overriding the default list")
+    p_longtail.add_argument("--author", help="Return this person's output (HN author_<h>, Discourse /u/<h>) instead of a query search")
+    p_longtail.add_argument("--json", action="store_true", help="Output structured JSON instead of a markdown digest")
+    p_longtail.add_argument("-o", "--output")
+
+    p_cdx = sub.add_parser("cdx", help="Enumerate historical-web captures (Wayback CDX server)")
+    p_cdx.add_argument("target", help="URL or domain to look up")
+    p_cdx.add_argument("--match", choices=["exact", "prefix", "host", "domain"], default="exact",
+                       help="Match scope for the target (default: exact)")
+    p_cdx.add_argument("--from", dest="from_date", help="Earliest capture, YYYY[MMDD]")
+    p_cdx.add_argument("--to", dest="to_date", help="Latest capture, YYYY[MMDD]")
+    p_cdx.add_argument("--filter", action="append", help="CDX filter <field:regex>; repeatable")
+    p_cdx.add_argument("--collapse", help="Collapse adjacent rows on a field, e.g. urlkey")
+    p_cdx.add_argument("--limit", type=int, default=100)
+    p_cdx.add_argument("--base", default=_CDX_WAYBACK_BASE,
+                       help="Advanced: CDX index base URL (swap in a Common Crawl index; same pywb dialect)")
+    p_cdx.add_argument("--cc", nargs="?", const=_CC_NEWEST_SENTINEL, default=None,
+                       metavar="CRAWL-ID",
+                       help="Query a Common Crawl index instead of Wayback; bare --cc resolves "
+                            "the newest crawl, or pass a crawl id (e.g. CC-MAIN-2026-25)")
+    p_cdx.add_argument("--fetch", nargs="?", type=int, const=3, default=None, metavar="N",
+                       help="After enumeration, fetch+extract the top N capture snapshots "
+                            "(default 3, cap 10; Wayback only)")
+    p_cdx.add_argument("--json", action="store_true", help="Output JSON instead of a markdown table")
+    p_cdx.add_argument("-o", "--output")
+
+    p_probe = sub.add_parser("probe", help="Attested batch probing across engines (emits a JSONL ledger)")
+    p_probe.add_argument("queries", nargs="*", help="Queries to probe (or use --queries-file)")
+    p_probe.add_argument("--hunt-id", help="Hunt id; ledger defaults to var/hunt/<id>/probes.jsonl")
+    p_probe.add_argument("--engines", required=True, help="Comma-separated: ddg,marginalia,hn,discourse,scholar,dblp,openaire,ntrs")
+    p_probe.add_argument("--ledger", help="Explicit ledger path (overrides the --hunt-id default)")
+    p_probe.add_argument("--queries-file", help="File with one query per line")
+    p_probe.add_argument("--limit", type=int, default=10)
+    p_probe.add_argument("--instances", help="Discourse instances (comma-separated) for the discourse engine")
+
     p_reddit = sub.add_parser("reddit", help="Fetch Reddit content via API")
     p_reddit.add_argument("target", help="Reddit URL or search query")
     p_reddit.add_argument("--search", action="store_true", help="Search Reddit instead of fetching URL")
@@ -201,6 +245,9 @@ def main():
         "gather": cmd_gather,
         "scholar": cmd_scholar,
         "news": cmd_news,
+        "longtail": cmd_longtail,
+        "cdx": cmd_cdx,
+        "probe": cmd_probe,
         "reddit": cmd_reddit,
         "transcript": cmd_transcript,
     }
@@ -275,7 +322,51 @@ def cmd_search(args):
     _write_output(json.dumps(results, indent=2), args.output)
 
 
-async def _scrape_static(url: str, want_raw: bool) -> str:
+def _looks_like_pdf_url(url: str) -> bool:
+    """True when the URL path ends in .pdf (query string ignored)."""
+    from urllib.parse import urlsplit
+    return urlsplit(url).path.lower().endswith(".pdf")
+
+
+def _extract_pdf_text(data: bytes, query: str | None) -> str:
+    """Extract text from PDF bytes via pypdf. With a query, keep only pages that
+    mention a query term (simple section filter); fall back to full text when no
+    page matches or no query is given."""
+    import io
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(data))
+    pages: list[str] = []
+    for page in reader.pages:
+        try:
+            pages.append(page.extract_text() or "")
+        except Exception:  # noqa: BLE001 — a single bad page shouldn't abort the doc
+            pages.append("")
+
+    if query:
+        terms = [t.lower() for t in re.findall(r"[A-Za-z0-9]+", query) if len(t) > 2]
+        if terms:
+            matched = [p for p in pages if any(t in p.lower() for t in terms)]
+            if matched:
+                return "\n\n".join(p.strip() for p in matched).strip()
+        # No page matched (or no usable terms) → return the whole document.
+    return "\n\n".join(p.strip() for p in pages).strip()
+
+
+async def _scrape_pdf(url: str, query: str | None) -> str:
+    import httpx
+
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; wscrape/1.0)"}
+    async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+        resp = await client.get(url, headers=headers)
+        resp.raise_for_status()
+        data = resp.content
+    return _extract_pdf_text(data, query)
+
+
+async def _scrape_static(url: str, want_raw: bool, query: str | None = None) -> tuple[str, bool]:
+    """Static fetch + extract. Returns (content, is_pdf). Detects PDFs by
+    content-type or the %PDF- magic bytes and routes them to pypdf."""
     import httpx
     import trafilatura
 
@@ -283,7 +374,12 @@ async def _scrape_static(url: str, want_raw: bool) -> str:
     async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
         resp = await client.get(url, headers=headers)
         resp.raise_for_status()
+        ctype = (resp.headers.get("content-type") or "").lower()
+        body = resp.content
         html = resp.text
+
+    if "application/pdf" in ctype or body[:5] == b"%PDF-":
+        return _extract_pdf_text(body, query), True
 
     extracted = trafilatura.extract(
         html,
@@ -292,7 +388,7 @@ async def _scrape_static(url: str, want_raw: bool) -> str:
         favor_precision=not want_raw,
         output_format="markdown",
     )
-    return extracted or ""
+    return extracted or "", False
 
 
 async def _scrape_js(url: str, want_raw: bool, query: str | None, use_cache: bool,
@@ -327,11 +423,17 @@ async def _scrape_js(url: str, want_raw: bool, query: str | None, use_cache: boo
 async def _do_scrape(url: str, force_js: bool, want_raw: bool, query: str | None,
                      use_cache: bool, robots: bool, magic: bool = False,
                      scroll: bool = False) -> str:
+    # A PDF is a PDF: extension detection wins over every browser-path flag,
+    # since Playwright/trafilatura cannot extract PDF text (they'd garble it).
+    if _looks_like_pdf_url(url):
+        return await _scrape_pdf(url, query)
     # A query (BM25) or a browser-only flag (magic/scroll) needs the rendered
     # page, so any of them forces the crawl4ai path over the static attempt.
     if not force_js and not query and not magic and not scroll:
         try:
-            content = await _scrape_static(url, want_raw)
+            content, is_pdf = await _scrape_static(url, want_raw, query)
+            if is_pdf:
+                return content  # content-type says PDF — never fall through to JS
             if len(content.strip()) >= 200:
                 return content
         except Exception:
@@ -537,6 +639,15 @@ _SCHOLAR_UA = "wscrape/1.0 (academic federation)"
 _CROSSREF_MAILTO = "you@example.com"        # set to your email (API polite pools)
 _SECRET_OPENALEX = "openalex"          # root scope (global tool): `secrets put openalex`
 _SECRET_S2 = "semantic-scholar"        # root scope (global tool): `secrets put semantic-scholar`
+
+# Keyless grey-literature endpoints (live-verified 2026-07-11). All anonymous,
+# no registration; per-endpoint rate ceilings are generous for a single CLI
+# call (one request per engine per invocation), so no in-call pacing is needed —
+# the probe loop applies per-engine pacing when the same engine is hit repeatedly.
+_OPENAIRE_BASE = "https://api.openaire.eu/graph/v1/researchProducts"
+_NTRS_BASE = "https://ntrs.nasa.gov/api/citations/search"
+_DBLP_BASE = "https://dblp.org/search/publ/api"
+_OSF_BASE = "https://api.osf.io/v2/preprints/"
 
 
 def _get_secret(name: str) -> str | None:
@@ -760,6 +871,158 @@ async def _scholar_semanticscholar(client, query: str, limit: int, key: str) -> 
     return out
 
 
+def _first_doi(pids: list[dict] | None) -> str | None:
+    """First DOI from an OpenAIRE pids list ([{scheme, value}, …])."""
+    for p in pids or []:
+        if (p.get("scheme") or "").lower() == "doi" and p.get("value"):
+            return p["value"]
+    return None
+
+
+async def _scholar_openaire(client, query: str, limit: int) -> list[dict]:
+    """OpenAIRE Graph API — keyless keyword search over research products
+    (publications, reports, theses). Heir to the dead OpenGrey/DART-Europe."""
+    r = await client.get(
+        _OPENAIRE_BASE,
+        params={"search": query, "pageSize": limit},
+        headers={"Accept": "application/json"},
+    )
+    r.raise_for_status()
+    out = []
+    for it in r.json().get("results", [])[:limit]:
+        doi = _first_doi(it.get("pids"))
+        pub_date = it.get("publicationDate") or ""
+        descriptions = it.get("descriptions") or []
+        abstract = _strip_html(descriptions[0]) if descriptions else ""
+        container = it.get("container") or {}
+        out.append({
+            "title": (it.get("mainTitle") or "").strip(),
+            "authors": [a.get("fullName") for a in it.get("authors", []) if a.get("fullName")],
+            "year": int(pub_date[:4]) if pub_date[:4].isdigit() else None,
+            "venue": container.get("name") or it.get("publisher") or "",
+            "doi": doi,
+            "url": f"https://doi.org/{doi}" if doi else "",
+            "citations": None,
+            "abstract": abstract,
+            "arxiv_id": None, "pmid": None,
+            "open_access": bool(it.get("openAccessColor")) or None,
+            "sources": ["openaire"],
+        })
+    return out
+
+
+async def _scholar_ntrs(client, query: str, limit: int) -> list[dict]:
+    """NASA NTRS — full-text-indexed technical reports (grey literature)."""
+    r = await client.get(
+        _NTRS_BASE,
+        params={"q": query, "size": limit},
+        headers={"Accept": "application/json"},
+    )
+    r.raise_for_status()
+    out = []
+    for it in r.json().get("results", [])[:limit]:
+        authors = [
+            (a.get("meta", {}).get("author") or {}).get("name")
+            for a in it.get("authorAffiliations", [])
+        ]
+        authors = [a for a in authors if a]
+        date = it.get("distributionDate") or it.get("submittedDate") or ""
+        cid = it.get("id")
+        # Report type + any report numbers land in the venue (NTRS has no journal).
+        report_nums = [rn.get("number") for rn in (it.get("otherReportNumbers") or [])
+                       if isinstance(rn, dict) and rn.get("number")]
+        venue_bits = [it.get("stiTypeDetails") or it.get("stiType") or "NASA NTRS"]
+        if report_nums:
+            venue_bits.append("; ".join(report_nums))
+        out.append({
+            "title": (it.get("title") or "").strip(),
+            "authors": authors,
+            "year": int(str(date)[:4]) if str(date)[:4].isdigit() else None,
+            "venue": " · ".join(v for v in venue_bits if v),
+            "doi": None,
+            "url": f"https://ntrs.nasa.gov/citations/{cid}" if cid else "",
+            "citations": None,
+            "abstract": (it.get("abstract") or "").strip(),
+            "arxiv_id": None, "pmid": None, "open_access": True,
+            "sources": ["ntrs"],
+        })
+    return out
+
+
+async def _scholar_dblp(client, query: str, limit: int) -> list[dict]:
+    """DBLP — computer-science bibliography (proceedings/journals). No abstracts."""
+    r = await client.get(
+        _DBLP_BASE,
+        params={"q": query, "format": "json", "h": limit},
+        headers={"Accept": "application/json"},
+    )
+    if r.status_code == 429:
+        # DBLP throttles ~1-2 req/s; honour Retry-After once (capped) then retry.
+        delay = min(float(r.headers.get("Retry-After", "2") or 2), 5.0)
+        await asyncio.sleep(delay)
+        r = await client.get(
+            _DBLP_BASE,
+            params={"q": query, "format": "json", "h": limit},
+            headers={"Accept": "application/json"},
+        )
+    r.raise_for_status()
+    hits = r.json().get("result", {}).get("hits", {}).get("hit", [])
+    out = []
+    for hit in hits[:limit]:
+        info = hit.get("info", {})
+        raw_authors = (info.get("authors") or {}).get("author") or []
+        if isinstance(raw_authors, dict):      # single-author records are not a list
+            raw_authors = [raw_authors]
+        authors = [a.get("text") for a in raw_authors if isinstance(a, dict) and a.get("text")]
+        out.append({
+            "title": _strip_html(info.get("title", "")).rstrip("."),
+            "authors": authors,
+            "year": int(info["year"]) if str(info.get("year", "")).isdigit() else None,
+            "venue": info.get("venue") or "",
+            "doi": info.get("doi"),
+            "url": info.get("ee") or info.get("url") or "",
+            "citations": None,
+            "abstract": "",                    # DBLP exposes no abstracts
+            "arxiv_id": None, "pmid": None,
+            "open_access": info.get("access") == "open",
+            "sources": ["dblp"],
+        })
+    return out
+
+
+async def _scholar_osf(client, query: str, limit: int) -> list[dict]:
+    """OSF Preprints (PsyArXiv, SocArXiv, …).
+
+    OSF's JSON:API exposes no full-text `filter[q]` (verified: 400); the closest
+    keyless keyword surface is `filter[title]`, a title-substring match. We use
+    it and flag the limitation honestly rather than fake a full-text search.
+    """
+    r = await client.get(
+        _OSF_BASE,
+        params={"filter[title]": query, "page[size]": limit},
+        headers={"Accept": "application/vnd.api+json"},
+    )
+    r.raise_for_status()
+    out = []
+    for it in r.json().get("data", [])[:limit]:
+        attrs = it.get("attributes", {})
+        links = it.get("links", {})
+        date = attrs.get("date_published") or ""
+        out.append({
+            "title": (attrs.get("title") or "").strip(),
+            "authors": [],                     # contributors need a second JSON:API call
+            "year": int(str(date)[:4]) if str(date)[:4].isdigit() else None,
+            "venue": "OSF Preprints",
+            "doi": attrs.get("doi"),
+            "url": links.get("html") or links.get("self") or "",
+            "citations": None,
+            "abstract": (attrs.get("description") or "").strip(),
+            "arxiv_id": None, "pmid": None, "open_access": True,
+            "sources": ["osf"],
+        })
+    return out
+
+
 def _short_err(e: Exception) -> str:
     import httpx
     if isinstance(e, httpx.HTTPStatusError):
@@ -771,11 +1034,16 @@ async def _do_scholar(query: str, limit: int, since_year: int | None,
                       open_access: bool) -> tuple[list[dict], list[tuple[str, str]]]:
     import httpx
 
-    # (name, coroutine-factory) — keyless core always runs.
+    # (name, coroutine-factory) — keyless core always runs. Grey-lit engines
+    # (OpenAIRE/NTRS/DBLP/OSF) are keyless too and federate alongside the core.
     active = [
         ("crossref", _scholar_crossref),
         ("arxiv", _scholar_arxiv),
         ("europepmc", _scholar_europepmc),
+        ("openaire", _scholar_openaire),
+        ("ntrs", _scholar_ntrs),
+        ("dblp", _scholar_dblp),
+        ("osf", _scholar_osf),
     ]
     coverage: list[tuple[str, str]] = []
 
@@ -957,24 +1225,87 @@ async def _news_google(client, query: str, limit: int, lang: str, country: str) 
     return out
 
 
-async def _hydrate_news(client, records: list[dict], top_n: int) -> None:
-    """Fetch top-N articles to add a snippet and resolve redirect URLs (in place).
+def _match_domain(urls: list[str], domain: str) -> str | None:
+    """Pick the source-domain URL (deepest path = most specific article), else
+    the first non-Google URL."""
+    from urllib.parse import urlsplit
 
-    Google News `rss/articles/…` links can't be resolved without a browser (they
-    bounce through a JS consent page), so we skip them rather than capture that
-    boilerplate — their records keep the redirect URL and no snippet.
+    def host(u: str) -> str:
+        h = urlsplit(u).netloc.lower()
+        return h[4:] if h.startswith("www.") else h
+
+    if domain:
+        d = domain.lower()
+        d = d[4:] if d.startswith("www.") else d
+        matches = [u for u in urls if host(u) == d or host(u).endswith("." + d)]
+        if matches:
+            # Prefer the most specific URL (a real article over a section/homepage).
+            return max(matches, key=lambda u: len(urlsplit(u).path.rstrip("/")))
+    for u in urls:
+        if "google." not in host(u):
+            return u
+    return None
+
+
+def _resolve_google_news(title: str, domain: str) -> str | None:
+    """Resolve a Google News stub to the real publisher URL via DuckDuckGo.
+
+    Google News `rss/articles/…` links are encrypted redirect stubs with no
+    locally-decodable target, so we search the headline and match the article's
+    source domain to recover the real URL — the manual workaround, automated.
+    """
+    import io
+    from ddgs import DDGS
+
+    if not title:
+        return None
+    old_stderr = sys.stderr
+    sys.stderr = io.StringIO()  # ddgs is noisy on stderr
+    try:
+        # Fast single backend — resolution favours speed over recall.
+        rows = list(DDGS().text(title, max_results=6, backend="lite"))
+    except Exception:
+        return None
+    finally:
+        sys.stderr = old_stderr
+    urls = [r.get("href") or r.get("url") or "" for r in rows]
+    return _match_domain([u for u in urls if u], domain)
+
+
+async def _hydrate_news(client, records: list[dict], top_n: int) -> None:
+    """Fetch top-N articles to add a snippet + resolve publisher URLs (in place).
+
+    Google News stubs are resolved by searching the headline and matching the
+    source domain (they can't be decoded locally); unresolvable stubs are left
+    as-is and counted for a stderr note rather than silently dropped.
     """
     import trafilatura
 
+    unresolved = 0
+    # Serialise DDG resolution searches: firing them concurrently trips
+    # DuckDuckGo's rate limiter, whose back-off stalls the whole hydration.
+    resolve_lock = asyncio.Semaphore(1)
+
     async def one(rec):
+        nonlocal unresolved
         url = rec.get("url") or ""
         if "news.google.com" in url:
-            return  # not statically resolvable — leave as-is
+            async with resolve_lock:
+                real = await asyncio.to_thread(
+                    _resolve_google_news, rec.get("title", ""), rec.get("domain", "")
+                )
+            if not real:
+                unresolved += 1
+                return
+            url = real
+            rec["url"] = real
+            rec["domain"] = rec.get("domain") or _domain_of(real)
         try:
             resp = await client.get(url, headers={"User-Agent": _SCHOLAR_UA}, timeout=15)
             resp.raise_for_status()
             final = str(resp.url)
             if "google.com" in _domain_of(final):
+                unresolved += 1
                 return  # bounced to a Google consent/interstitial page
             text = trafilatura.extract(resp.text, favor_precision=True, include_comments=False) or ""
             if text:
@@ -985,6 +1316,10 @@ async def _hydrate_news(client, records: list[dict], top_n: int) -> None:
             pass  # hydration is best-effort; leave the record as-is
 
     await asyncio.gather(*(one(r) for r in records[:top_n]))
+    if unresolved:
+        print(f"wscrape news: {unresolved} result(s) could not be resolved to a "
+              "source URL (Google News redirect stubs) — snippet unavailable.",
+              file=sys.stderr)
 
 
 async def _do_news(query: str, limit: int, recent: str | None, lang: str, country: str,
@@ -997,7 +1332,10 @@ async def _do_news(query: str, limit: int, recent: str | None, lang: str, countr
         active.append(("googlenews", lambda c: _news_google(c, query, limit, lang, country)))
 
     coverage: list[tuple[str, str]] = []
-    async with httpx.AsyncClient(follow_redirects=True, timeout=20,
+    # Short connect timeout so an unreachable engine (e.g. GDELT on a blocked
+    # egress) fails fast instead of stalling the whole query for 20s.
+    timeout = httpx.Timeout(18.0, connect=6.0)
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout,
                                  headers={"User-Agent": _SCHOLAR_UA}) as client:
         names = [n for n, _ in active]
         results = await asyncio.gather(*(fn(client) for _, fn in active), return_exceptions=True)
@@ -1052,6 +1390,702 @@ def cmd_news(args):
         _write_output(json.dumps(results, indent=2), args.output)
     else:
         _write_output(_format_news_digest(results, args.query), args.output)
+
+
+# ── longtail: federated small-web / community search ────────────────────────
+#
+# Keyless-first (REQ-013): Marginalia (small-web index), HN Algolia (full HN
+# corpus), and a Discourse fan-out (one adapter → thousands of forums) all run
+# without keys. Same house style as scholar/news: per-engine async adapters
+# returning list[dict], RRF merge on a canonical-URL key, graceful per-engine
+# failure with a stderr coverage line. Force-multipliers over one-off adapters
+# so a dead surface is a one-line diff (Wiby/Lemmy gate on a real blanked hunt).
+
+_LONGTAIL_UA = "wscrape/1.0 (community federation)"
+_MARGINALIA_BASE = "https://api2.marginalia-search.com/search"
+
+# Curated large public Discourse instances; overridable via --instances.
+_DISCOURSE_DEFAULT_INSTANCES = [
+    "meta.discourse.org",
+    "discuss.python.org",
+    "community.openai.com",
+    "forum.obsidian.md",
+]
+
+
+class _Throttled(Exception):
+    """A keyless engine refused the call for rate reasons (e.g. Marginalia QPM)."""
+
+
+def _strip_html(text: str) -> str:
+    import html
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", text or ""))).strip()
+
+
+def _parse_instances(arg: str | None) -> list[str]:
+    """Normalise a --instances value to a list of bare hosts (default list if None)."""
+    if not arg:
+        return list(_DISCOURSE_DEFAULT_INSTANCES)
+    hosts = []
+    for raw in arg.split(","):
+        h = raw.strip()
+        if not h:
+            continue
+        h = re.sub(r"^https?://", "", h).rstrip("/")
+        hosts.append(h)
+    return hosts
+
+
+async def _longtail_marginalia(client, query: str, limit: int, author: str | None = None) -> list[dict]:
+    # Marginalia has no author/actor endpoint — author-mode has nothing to offer.
+    if author:
+        return []
+    r = await client.get(
+        _MARGINALIA_BASE, params={"query": query, "count": limit},
+        headers={"API-Key": "public"},
+    )
+    r.raise_for_status()
+    try:
+        data = r.json()
+    except Exception:
+        # 200 + plain body "QPM Limit Exceeded" is the throttle signal.
+        raise _Throttled("QPM")
+    out = []
+    for it in data.get("results", [])[:limit]:
+        url = it.get("url", "")
+        out.append({
+            "title": (it.get("title") or "").strip(),
+            "url": url,
+            "snippet": _strip_html(it.get("description", ""))[:300],
+            "domain": _domain_of(url),
+            "date": None, "author": None,
+            "sources": ["marginalia"],
+        })
+    return out
+
+
+def _hn_record(hit: dict) -> dict:
+    oid = hit.get("objectID")
+    title = (hit.get("title") or hit.get("story_title")
+             or _strip_html(hit.get("comment_text", ""))[:80] or "(HN item)")
+    url = hit.get("url") or (f"https://news.ycombinator.com/item?id={oid}" if oid else "")
+    text = hit.get("story_text") or hit.get("comment_text") or ""
+    return {
+        "title": title.strip(),
+        "url": url,
+        "snippet": _strip_html(text)[:300],
+        "domain": _domain_of(url),
+        "date": hit.get("created_at"),
+        "author": hit.get("author"),
+        "sources": ["hn"],
+    }
+
+
+async def _longtail_hn(client, query: str, limit: int, author: str | None = None) -> list[dict]:
+    params = {"hitsPerPage": limit}
+    if author:
+        params["tags"] = f"author_{author}"   # actor enumeration, not query search
+    else:
+        params["query"] = query
+    r = await client.get("https://hn.algolia.com/api/v1/search", params=params)
+    r.raise_for_status()
+    return [_hn_record(h) for h in r.json().get("hits", [])[:limit]]
+
+
+async def _discourse_one(client, host: str, query: str, limit: int, author: str | None) -> list[dict]:
+    if author:
+        # /u/<handle>/activity.json serves RSS (not JSON) — parse it as such.
+        import xml.etree.ElementTree as ET
+        r = await client.get(f"https://{host}/u/{author}/activity.json")
+        r.raise_for_status()
+        out = []
+        for item in ET.fromstring(r.text).findall(".//item")[:limit]:
+            out.append({
+                "title": (item.findtext("title", "") or "").strip(),
+                "url": item.findtext("link", "") or "",
+                "snippet": _strip_html(item.findtext("description", ""))[:300],
+                "domain": host,
+                "date": item.findtext("pubDate", "") or "",
+                "author": author,
+                "sources": ["discourse"],
+            })
+        return out
+
+    r = await client.get(f"https://{host}/search.json", params={"q": query})
+    r.raise_for_status()
+    data = r.json()
+    topics = {t["id"]: t for t in data.get("topics", [])}
+    out = []
+    for p in data.get("posts", [])[:limit]:
+        tid = p.get("topic_id")
+        topic = topics.get(tid, {})
+        slug = topic.get("slug") or "-"
+        pn = p.get("post_number", 1)
+        url = f"https://{host}/t/{slug}/{tid}/{pn}" if tid else f"https://{host}"
+        out.append({
+            "title": (topic.get("title") or topic.get("fancy_title") or "(post)").strip(),
+            "url": url,
+            "snippet": _strip_html(p.get("blurb", ""))[:300],
+            "domain": host,
+            "date": p.get("created_at"),
+            "author": p.get("username"),
+            "sources": ["discourse"],
+        })
+    return out
+
+
+async def _longtail_discourse(client, query: str, limit: int, instances: list[str],
+                              author: str | None = None,
+                              coverage: list[tuple[str, str]] | None = None) -> list[dict]:
+    """Fan out across Discourse instances; each instance answers or fails on its own."""
+    results = await asyncio.gather(
+        *(_discourse_one(client, h, query, limit, author) for h in instances),
+        return_exceptions=True,
+    )
+    merged: list[list[dict]] = []
+    for host, res in zip(instances, results):
+        if isinstance(res, Exception):
+            if coverage is not None:
+                coverage.append((f"discourse:{host}", f"failed: {_short_err(res)}"))
+        else:
+            if coverage is not None:
+                coverage.append((f"discourse:{host}", f"ok ({len(res)})"))
+            merged.append(res)
+    # Flatten per-instance lists into one ranked list for the RRF stage.
+    flat: list[dict] = []
+    for rlist in merged:
+        flat.extend(rlist)
+    return flat
+
+
+async def _do_longtail(query: str, limit: int, engines: list[str], instances: list[str],
+                       author: str | None) -> tuple[list[dict], list[tuple[str, str]]]:
+    import httpx
+
+    coverage: list[tuple[str, str]] = []
+    timeout = httpx.Timeout(18.0, connect=6.0)
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout,
+                                 headers={"User-Agent": _LONGTAIL_UA}) as client:
+        tasks = []          # (name, coroutine)
+        for name in engines:
+            if name == "marginalia":
+                tasks.append((name, _longtail_marginalia(client, query, limit, author)))
+            elif name == "hn":
+                tasks.append((name, _longtail_hn(client, query, limit, author)))
+            elif name == "discourse":
+                # Discourse reports its own per-instance coverage rows.
+                tasks.append((name, _longtail_discourse(client, query, limit, instances,
+                                                        author, coverage)))
+        results = await asyncio.gather(*(t for _, t in tasks), return_exceptions=True)
+
+    ranked_lists = []
+    for (name, _), res in zip(tasks, results):
+        if name == "discourse":
+            # coverage already recorded per instance; add the merged list if any.
+            if not isinstance(res, Exception):
+                if res:
+                    ranked_lists.append(res)
+            else:
+                coverage.append((name, f"failed: {_short_err(res)}"))
+            continue
+        if isinstance(res, Exception):
+            coverage.append((name, f"failed: {_short_err(res)}"))
+        elif author and name == "marginalia":
+            coverage.append((name, "skipped (no author mode)"))
+        else:
+            coverage.append((name, f"ok ({len(res)})"))
+            ranked_lists.append(res)
+
+    merged = _rrf_merge(ranked_lists, key_fn=_news_key)[:limit]
+    return merged, coverage
+
+
+def _format_longtail_digest(results: list[dict], query: str, author: str | None) -> str:
+    head = f"Longtail: {'author ' + author if author else query}"
+    if not results:
+        return f"# {head}\n\n_No results._"
+    srcs = sorted({s for r in results for s in r.get("sources", [])})
+    lines = [f"# {head}", f"_{len(results)} results · sources: {', '.join(srcs)}_", ""]
+    for i, r in enumerate(results, 1):
+        meta = " · ".join(p for p in [
+            r.get("author") or "", r.get("domain") or "",
+            _fmt_news_date(r.get("date", "")) if re.match(r"\d{8}", r.get("date", "") or "") else (r.get("date") or ""),
+        ] if p)
+        lines.append(f"## {i}. {r.get('title', '').strip()}")
+        if meta:
+            lines.append(meta)
+        if r.get("url"):
+            lines.append(r["url"])
+        if r.get("snippet"):
+            lines.append(f"\n> {r['snippet']}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def cmd_longtail(args):
+    engines = ([e.strip() for e in args.engines.split(",") if e.strip()]
+               if args.engines else ["marginalia", "discourse", "hn"])
+    instances = _parse_instances(args.instances)
+    try:
+        results, coverage = asyncio.run(
+            _do_longtail(args.query, args.limit, engines, instances, args.author)
+        )
+    except Exception as e:
+        print(f"Longtail failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print("wscrape longtail: " + "  ".join(f"{n} {s}" for n, s in coverage), file=sys.stderr)
+
+    if args.json:
+        _write_output(json.dumps(results, indent=2), args.output)
+    else:
+        _write_output(_format_longtail_digest(results, args.query, args.author), args.output)
+
+
+# ── cdx: historical-web read path (Wayback CDX server) ──────────────────────
+#
+# CDX is URL-in, captures-out (no keyword search over content — that surface
+# does not exist keyless). The client takes the index base URL as a parameter
+# so a Common Crawl index (same pywb CDX dialect) can be swapped in later
+# without a second implementation. archive.org throttles aggressively.
+
+_CDX_WAYBACK_BASE = "https://web.archive.org/cdx/search/cdx"
+_CDX_UA = "wscrape/1.0 (historical-web read)"
+_CDX_MIN_INTERVAL = 3.0   # polite pacing (~1 req/3s) between snapshot fetches
+_CC_COLLINFO = "https://index.commoncrawl.org/collinfo.json"
+_CC_INDEX_BASE = "https://index.commoncrawl.org"
+_CC_NEWEST_SENTINEL = "__newest__"   # `--cc` with no id → resolve the newest crawl
+_CDX_FETCH_CAP = 10                  # hard cap on snapshots fetched per command
+
+
+def _cdx_params(target: str, match: str = "exact", from_date: str | None = None,
+                to_date: str | None = None, filters: list[str] | None = None,
+                collapse: str | None = None, limit: int | None = None) -> dict:
+    """Build CDX server query params (pywb dialect; shared by Wayback + CC index)."""
+    p: dict = {"url": target, "output": "json"}
+    if match:
+        p["matchType"] = match
+    if from_date:
+        p["from"] = from_date
+    if to_date:
+        p["to"] = to_date
+    if collapse:
+        p["collapse"] = collapse
+    if limit:
+        p["limit"] = int(limit)
+    if filters:
+        p["filter"] = list(filters)   # httpx repeats the key: filter=a&filter=b
+    return p
+
+
+def _parse_cdx_response(text: str) -> list[dict]:
+    """Parse a CDX response into a list of row dicts, handling both dialects:
+    Wayback emits a single JSON array-of-arrays (header row + rows); Common
+    Crawl emits newline-delimited JSON objects (one per capture)."""
+    text = text.strip()
+    if not text:
+        return []
+    if text[0] == "[":                     # Wayback: [[header], [row], …]
+        data = json.loads(text)
+        if not data:
+            return []
+        header, out = data[0], []
+        for row in data[1:]:
+            out.append(dict(zip(header, row)))
+        return out
+    out = []                               # Common Crawl: NDJSON objects
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+async def _cdx_query(base_url: str, target: str, match: str, from_date: str | None,
+                     to_date: str | None, filters: list[str] | None,
+                     collapse: str | None, limit: int | None,
+                     add_wayback: bool = True) -> list[dict]:
+    import httpx
+
+    params = _cdx_params(target, match, from_date, to_date, filters, collapse, limit)
+    async with httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(30.0, connect=8.0),
+                                 headers={"User-Agent": _CDX_UA}) as client:
+        r = await client.get(base_url, params=params)
+        r.raise_for_status()
+        rows = _parse_cdx_response(r.text)
+    if add_wayback:
+        # Wayback rows get a snapshot URL; CC rows carry WARC pointers instead.
+        for rec in rows:
+            ts, orig = rec.get("timestamp", ""), rec.get("original", "")
+            rec["wayback_url"] = f"https://web.archive.org/web/{ts}/{orig}" if ts and orig else ""
+    return rows
+
+
+async def _cc_resolve_newest() -> str:
+    """Return the newest Common Crawl crawl id via collinfo.json (list is newest-first)."""
+    import httpx
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(30.0, connect=8.0),
+                                 headers={"User-Agent": _CDX_UA}) as client:
+        r = await client.get(_CC_COLLINFO)
+        r.raise_for_status()
+        crawls = r.json()
+    if not crawls:
+        raise RuntimeError("Common Crawl collinfo.json returned no crawls")
+    return crawls[0]["id"]
+
+
+def _cc_base(crawl_id: str) -> str:
+    return f"{_CC_INDEX_BASE}/{crawl_id}-index"
+
+
+async def _cdx_fetch_snapshots(rows: list[dict], n: int) -> list[dict]:
+    """Fetch+extract the top N Wayback captures via the `id_` raw-capture form.
+    Polite ≥3s pacing; per-snapshot failures (429/refused) are reported, not fatal."""
+    import httpx
+    import trafilatura
+
+    out: list[dict] = []
+    fetched = 0
+    async with httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(30.0, connect=8.0),
+                                 headers={"User-Agent": _CDX_UA}) as client:
+        for row in rows:
+            if fetched >= n:
+                break
+            ts = row.get("timestamp", "")
+            orig = row.get("original", "") or row.get("url", "")
+            if not ts or not orig:
+                continue
+            if fetched > 0:
+                await asyncio.sleep(_CDX_MIN_INTERVAL)   # archive.org throttles hard
+            # `id_` serves the raw archived HTML without archive.org's rewriting.
+            raw_url = f"https://web.archive.org/web/{ts}id_/{orig}"
+            rec = {"timestamp": ts, "original": orig, "content": "", "error": None}
+            try:
+                resp = await client.get(raw_url)
+                resp.raise_for_status()
+                text = trafilatura.extract(
+                    resp.text, include_tables=True, output_format="markdown"
+                ) or ""
+                rec["content"] = text or "_(no extractable content)_"
+            except httpx.HTTPStatusError as e:
+                rec["error"] = f"HTTP {e.response.status_code}"
+            except Exception as e:  # noqa: BLE001 — one snapshot must not fail the command
+                rec["error"] = type(e).__name__
+            out.append(rec)
+            fetched += 1
+    return out
+
+
+def _format_cdx_table(rows: list[dict], target: str, cc: bool = False) -> str:
+    if not rows:
+        return f"# CDX: {target}\n\n_No captures._"
+    src = "Common Crawl" if cc else "Wayback"
+    if cc:
+        # CC rows have no Wayback snapshot; expose the WARC pointers instead.
+        lines = [f"# CDX ({src}): {target}", f"_{len(rows)} captures_", "",
+                 "| timestamp | status | mime | url | filename | offset | length |",
+                 "|---|---|---|---|---|---|---|"]
+        for r in rows:
+            url = (r.get("url", "") or r.get("original", "") or "").replace("|", "%7C")
+            fn = (r.get("filename", "") or "").replace("|", "%7C")
+            lines.append(f"| {r.get('timestamp','')} | {r.get('status','')} | "
+                         f"{r.get('mime','')} | {url} | {fn} | "
+                         f"{r.get('offset','')} | {r.get('length','')} |")
+        return "\n".join(lines)
+    lines = [f"# CDX ({src}): {target}", f"_{len(rows)} captures_", "",
+             "| timestamp | status | mime | original |",
+             "|---|---|---|---|"]
+    for r in rows:
+        orig = (r.get("original", "") or "").replace("|", "%7C")
+        lines.append(f"| {r.get('timestamp','')} | {r.get('statuscode','')} | "
+                     f"{r.get('mimetype','')} | {orig} |")
+    return "\n".join(lines)
+
+
+def _format_cdx_snapshots(snaps: list[dict], target: str) -> str:
+    lines = [f"# CDX snapshots: {target}", f"_{len(snaps)} snapshot(s) fetched_", ""]
+    for s in snaps:
+        lines.append(f"## {s.get('timestamp','')} {s.get('original','')}")
+        lines.append("")
+        if s.get("error"):
+            lines.append(f"_(fetch failed: {s['error']})_")
+        else:
+            lines.append((s.get("content") or "").strip())
+        lines.append("")
+    return "\n".join(lines)
+
+
+async def _cdx_collect(args, is_cc: bool) -> tuple[list[dict], str]:
+    """Resolve the index base (Wayback or a Common Crawl crawl), then query it.
+    Returns (rows, crawl_label). --cc takes precedence over --base."""
+    filters = [f.strip() for f in args.filter] if args.filter else None
+    if is_cc:
+        crawl_id = (await _cc_resolve_newest()
+                    if args.cc == _CC_NEWEST_SENTINEL else args.cc)
+        base, label = _cc_base(crawl_id), crawl_id
+    else:
+        base, label = args.base, "wayback"
+    rows = await _cdx_query(
+        base, args.target, args.match, args.from_date, args.to_date,
+        filters, args.collapse, args.limit, add_wayback=not is_cc,
+    )
+    return rows, label
+
+
+def cmd_cdx(args):
+    import httpx
+
+    is_cc = args.cc is not None
+    # --fetch retrieves Wayback snapshots; CC rows are WARC pointers, not snapshots.
+    if args.fetch is not None and is_cc:
+        print("wscrape cdx: --fetch is Wayback-only — Common Crawl rows are WARC "
+              "pointers (filename/offset/length), not fetchable snapshots.", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        rows, label = asyncio.run(_cdx_collect(args, is_cc))
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 429:
+            print("wscrape cdx: rate-limited by archive.org (HTTP 429) — it throttles "
+                  "aggressively; wait a minute and retry, or lower --limit.", file=sys.stderr)
+        else:
+            print(f"wscrape cdx: HTTP {e.response.status_code} from the CDX server.", file=sys.stderr)
+        sys.exit(1)
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
+        print(f"wscrape cdx: could not reach the CDX server ({type(e).__name__}) — "
+              "the index may be throttling or refusing the connection; retry shortly.",
+              file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"CDX failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if is_cc:
+        print(f"wscrape cdx: Common Crawl index {label} ({len(rows)} rows)", file=sys.stderr)
+
+    # Optional snapshot fetch-and-extract (Wayback only).
+    snaps: list[dict] = []
+    if args.fetch is not None and rows:
+        n = max(1, min(args.fetch, _CDX_FETCH_CAP))
+        try:
+            snaps = asyncio.run(_cdx_fetch_snapshots(rows, n))
+        except Exception as e:  # noqa: BLE001 — enumeration already succeeded; degrade gracefully
+            print(f"wscrape cdx: snapshot fetch failed ({type(e).__name__}); "
+                  "returning enumeration only.", file=sys.stderr)
+        failed = sum(1 for s in snaps if s.get("error"))
+        if failed:
+            print(f"wscrape cdx: {failed}/{len(snaps)} snapshot fetch(es) failed "
+                  "(archive.org throttling) — reported per snapshot below.", file=sys.stderr)
+
+    if args.json:
+        payload = {"rows": rows, "snapshots": snaps} if snaps else rows
+        _write_output(json.dumps(payload, indent=2), args.output)
+    else:
+        out = _format_cdx_table(rows, args.target, cc=is_cc)
+        if snaps:
+            out += "\n\n" + _format_cdx_snapshots(snaps, args.target)
+        _write_output(out, args.output)
+
+
+# ── probe: attested batch probing ───────────────────────────────────────────
+#
+# Deterministic plumbing for the /hunt skill: many queries × many engines, with
+# per-engine polite pacing and per-engine canaries. Each probe (canaries too)
+# appends one JSONL line to the ledger AS IT EXECUTES — attestation is execution
+# exhaust, never reconstructed post-hoc. A failed canary does NOT abort; it
+# stamps every record for that engine UNVERIFIED (canary_status="fail").
+
+# Minimum seconds between consecutive calls to the same engine (documented).
+_PROBE_PACING = {
+    "marginalia": 6.0,   # undocumented QPM throttle; stay well under it
+    "hn": 0.5,           # 10k req/hr/IP — generous
+    "discourse": 2.0,    # per instance; fan-out is concurrent, pacing is between probes
+    "ddg": 2.0,          # DuckDuckGo back-off is punishing
+    "scholar": 3.0,      # federated (Crossref/arXiv/EuropePMC/grey-lit) — polite cadence
+    "dblp": 1.0,         # ~1-2 req/s; 429+Retry-After handled in the adapter
+    "openaire": 1.0,     # 60 req/hr anonymous — 1s spacing is ample for a probe run
+    "ntrs": 1.0,         # fast JSON; be polite
+}
+
+# Stable known-hit canaries: a blank here means the surface is down, not empty.
+_PROBE_CANARIES = {
+    "marginalia": "linux",
+    "hn": "python",
+    "discourse": "forum",
+    "ddg": "example",
+    "scholar": "cancer",
+    "dblp": "database",
+    "openaire": "climate",
+    "ntrs": "aerodynamics",
+}
+
+
+def _result_id(rec: dict) -> str:
+    """Stable id for a probe hit: DOI (scholar) else canonical URL else title."""
+    doi = _norm_doi(rec.get("doi"))
+    if doi:
+        return f"doi:{doi}"
+    return rec.get("url") or rec.get("title") or ""
+
+
+def _ledger_record(hunt_id: str, surface: str, query: str, params: dict,
+                   records: list[dict], outcome: str, canary_status: str) -> dict:
+    """Build one contractual ledger line (fields are a fixed contract)."""
+    return {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "hunt_id": hunt_id,
+        "surface": surface,
+        "query_verbatim": query,
+        "params": params,
+        "hit_count": len(records),
+        "top_result_ids": [_result_id(r) for r in records[:5]],
+        "outcome": outcome,
+        "canary_status": canary_status,
+        "wscrape_version": __version__,
+    }
+
+
+def _append_ledger(path: str, record: dict) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+async def _probe_call(engine: str, client, query: str, limit: int,
+                      instances: list[str]) -> list[dict]:
+    """Run one query against one engine, returning hit records (may raise)."""
+    if engine == "ddg":
+        return await asyncio.to_thread(_ddg_probe, query, limit)
+    if engine == "marginalia":
+        return await _longtail_marginalia(client, query, limit)
+    if engine == "hn":
+        return await _longtail_hn(client, query, limit)
+    if engine == "discourse":
+        return await _longtail_discourse(client, query, limit, instances)
+    if engine == "scholar":
+        recs, _cov = await _do_scholar(query, limit, None, False)
+        return recs
+    if engine == "dblp":
+        return await _scholar_dblp(client, query, limit)
+    if engine == "openaire":
+        return await _scholar_openaire(client, query, limit)
+    if engine == "ntrs":
+        return await _scholar_ntrs(client, query, limit)
+    raise ValueError(f"unknown engine: {engine}")
+
+
+def _ddg_probe(query: str, limit: int) -> list[dict]:
+    import io
+    from ddgs import DDGS
+
+    old_stderr = sys.stderr
+    sys.stderr = io.StringIO()   # ddgs is noisy on stderr
+    try:
+        rows = list(DDGS().text(query, max_results=limit, backend="lite"))
+    finally:
+        sys.stderr = old_stderr
+    return [{"title": r.get("title", ""), "url": r.get("href") or r.get("url") or "",
+             "sources": ["ddg"]} for r in rows]
+
+
+async def _safe_probe_call(engine: str, client, query: str, limit: int,
+                           instances: list[str]) -> tuple[list[dict], str]:
+    """Map a probe call to (records, outcome) in the contractual enum.
+
+    Kept httpx-free (timeouts detected by exception-class name) so the loop is
+    unit-testable without the script's runtime deps.
+    """
+    try:
+        recs = await _probe_call(engine, client, query, limit, instances)
+    except _Throttled:
+        return [], "blocked"        # rate-limited (e.g. Marginalia QPM)
+    except Exception as e:          # noqa: BLE001 — everything maps to the enum
+        return [], ("timeout" if "Timeout" in type(e).__name__ else "blocked")
+    return recs, ("ok" if recs else "empty")
+
+
+async def _do_probe(engines: list[str], queries: list[str], limit: int,
+                    instances: list[str], hunt_id: str, ledger_path: str | None,
+                    client=None) -> tuple[list[dict], list[str]]:
+    """Core probe loop. `client` is injected (see _probe_session) so this stays
+    testable without httpx — a mocked _probe_call ignores it entirely."""
+    records_out: list[dict] = []
+    warnings: list[str] = []
+    for engine in engines:
+        interval = _PROBE_PACING.get(engine, 3.0)
+        canary_q = _PROBE_CANARIES.get(engine, "test")
+        calls = [(canary_q, True)] + [(q, False) for q in queries]
+        canary_status = "fail"
+        for idx, (q, is_canary) in enumerate(calls):
+            if idx > 0:
+                await asyncio.sleep(interval)   # per-engine polite pacing
+            recs, outcome = await _safe_probe_call(engine, client, q, limit, instances)
+            if is_canary:
+                canary_status = "pass" if outcome == "ok" else "fail"
+                if canary_status == "fail":
+                    warnings.append(
+                        f"{engine} canary '{q}' failed ({outcome}) — subsequent "
+                        f"{engine} records marked UNVERIFIED (canary_status=fail)")
+            rec = _ledger_record(hunt_id, engine, q, {"limit": limit}, recs,
+                                 outcome, canary_status)
+            if ledger_path:
+                _append_ledger(ledger_path, rec)   # exhaust: written as it executes
+            records_out.append(rec)
+    return records_out, warnings
+
+
+async def _probe_session(engines, queries, limit, instances, hunt_id, ledger_path):
+    """Open the shared httpx client, then run the probe loop against it."""
+    import httpx
+
+    timeout = httpx.Timeout(20.0, connect=6.0)
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout,
+                                 headers={"User-Agent": _LONGTAIL_UA}) as client:
+        return await _do_probe(engines, queries, limit, instances,
+                               hunt_id, ledger_path, client)
+
+
+def cmd_probe(args):
+    engines = [e.strip() for e in args.engines.split(",") if e.strip()]
+    unknown = [e for e in engines if e not in _PROBE_PACING]
+    if unknown:
+        print(f"wscrape probe: unknown engine(s): {', '.join(unknown)} "
+              f"(valid: {', '.join(sorted(_PROBE_PACING))})", file=sys.stderr)
+        sys.exit(1)
+
+    queries = list(args.queries)
+    if args.queries_file:
+        queries += [ln.strip() for ln in Path(args.queries_file).read_text().splitlines()
+                    if ln.strip()]
+    if not queries:
+        print("wscrape probe: no queries given (pass them positionally or via --queries-file)",
+              file=sys.stderr)
+        sys.exit(1)
+
+    hunt_id = args.hunt_id or ""
+    ledger_path = args.ledger or (f"var/hunt/{hunt_id}/probes.jsonl" if hunt_id else None)
+    instances = _parse_instances(args.instances)
+
+    try:
+        records, warnings = asyncio.run(
+            _probe_session(engines, queries, args.limit, instances, hunt_id, ledger_path)
+        )
+    except Exception as e:
+        print(f"Probe failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    for w in warnings:
+        print(f"wscrape probe: {w}", file=sys.stderr)
+    if ledger_path:
+        print(f"wscrape probe: {len(records)} probe(s) attested to {ledger_path}", file=sys.stderr)
+
+    print(json.dumps(records, indent=2))
 
 
 _REDDIT_HEADERS = {"User-Agent": "wscrape/1.0 (personal CLI tool)"}

@@ -56,8 +56,10 @@ Follow this escalation:
 3. **map + scrape** — large site, need a specific subpage. Map to find URL, then scrape.
 4. **crawl** — need bulk content from an entire section.
 5. **gather** — have a *question*, not a URL list. Adaptively crawls from a start URL until it has enough to answer the query.
-6. **scholar** — searching *academic literature*? Federates Crossref + arXiv + Europe PMC into one ranked, deduplicated result set. No URL needed.
+6. **scholar** — searching *academic literature*? Federates 7 keyless engines (Crossref, arXiv, Europe PMC, OpenAIRE, NTRS, DBLP, OSF) into one ranked, deduplicated result set. No URL needed.
 7. **news** — searching *news articles*? Federates GDELT (and optional Google News) into one recency-ranked, deduplicated set.
+8. **longtail** — hunting the *small web/communities* (forums, niche blogs, HN) rather than mainstream-indexed pages? Federates Marginalia + Discourse + HN Algolia.
+9. **cdx** — need *historical* captures of a URL/domain (dead pages, pre-2010 web)? Enumerates Wayback (or Common Crawl) captures; `--fetch` pulls and extracts the top snapshots.
 
 ## Output directory
 
@@ -75,6 +77,7 @@ wscrape scrape https://example.com -o var/wscrape/example.md
 wscrape scrape https://example.com --js -o var/wscrape/example.md
 wscrape scrape https://example.com --raw -o var/wscrape/example.md    # full page, no stripping
 wscrape scrape https://example.com --query "pricing tiers" -o var/wscrape/example.md  # BM25 passages
+wscrape scrape https://arxiv.org/pdf/2301.00234 -o var/wscrape/paper.md  # PDFs handled transparently (pypdf)
 
 # URL discovery
 wscrape map https://example.com -o var/wscrape/urls.txt
@@ -98,6 +101,20 @@ wscrape scholar "mRNA vaccine" --since-year 2023 --open-access --json -o var/wsc
 # News — news articles (GDELT by default, keyless)
 wscrape news "interest rate cuts" --recent w --limit 10 -o var/wscrape/news.md
 wscrape news "central bank policy" --hydrate --limit 8 -o var/wscrape/news.md   # add real snippets
+
+# Longtail — small web / communities (Marginalia + Discourse + HN Algolia, keyless)
+wscrape longtail "vim macro recipes" --limit 10 -o var/wscrape/longtail.md
+wscrape longtail "n64 linux port" --engines hn,discourse -o var/wscrape/longtail.md  # narrow engines
+wscrape longtail someuser --author someuser --engines hn,discourse -o var/wscrape/author.md  # sweep a person's output (query is required but ignored in --author mode)
+
+# CDX — historical-web captures (Wayback CDX; optional Common Crawl)
+wscrape cdx example.com --limit 20 -o var/wscrape/cdx.md
+wscrape cdx https://example.com/old-page --from 2005 --to 2010 -o var/wscrape/cdx.md
+wscrape cdx example.com --fetch 3 -o var/wscrape/cdx-snapshots.md   # fetch + extract top 3 snapshots
+wscrape cdx example.com --cc -o var/wscrape/cc.md                  # query Common Crawl instead
+
+# Probe — attested batch probing (used by the /hunt skill; JSONL ledger as a side effect)
+wscrape probe "obscure forum topic" --engines hn,marginalia --hunt-id 20260711-example --limit 5
 ```
 
 ### Fetch flags (scrape, map, crawl)
@@ -147,15 +164,16 @@ wait
 
 ## Academic search (scholar)
 
-`scholar` federates keyless academic APIs — **Crossref** (cross-publisher backbone), **arXiv** (preprints), **Europe PMC** (biomedical) — merges them with reciprocal rank fusion, deduplicates by DOI, and surfaces citation counts. No API key required.
+`scholar` federates **7 keyless engines** — **Crossref** (cross-publisher backbone), **arXiv** (preprints), **Europe PMC** (biomedical), **OpenAIRE** (grey literature — reports/theses), **NTRS** (NASA technical reports), **DBLP** (CS bibliography — no abstracts), **OSF Preprints** (title-substring search only, no authors) — merges them with reciprocal rank fusion, deduplicates by DOI (falling back to arXiv id/PMID/title), and surfaces citation counts where available. No API key required.
 
 ```bash
 wscrape scholar "<query>" [--limit N] [--since-year YYYY] [--open-access] [--json]
 ```
 
 - Markdown digest by default (title, authors, year, venue, citations, DOI/URL, abstract); `--json` emits structured records for programmatic use.
-- A **coverage line on stderr** reports which engines answered, failed, or were skipped — read it to judge recall confidence (e.g. `crossref ok (10)  arxiv ok (10)  europepmc ok (8)`).
+- A **coverage line on stderr** reports which engines answered, failed, or were skipped — read it to judge recall confidence (e.g. `crossref ok (10)  arxiv ok (10)  europepmc ok (8)  openaire ok (6)  ntrs ok (0)  dblp ok (4)  osf ok (2)`).
 - Prefer `scholar` over `search` for papers, DOIs, citations, and literature reviews — it returns typed, deduplicated academic records rather than noisy web hits.
+- **Honesty notes**: DBLP exposes no abstracts; NTRS has no journal venue, so report type/numbers are folded into the venue field; OSF's keyless search is title-substring only (no full-text query param) and returns no author list.
 
 **Optional keyed engines** — OpenAlex and Semantic Scholar join the federation automatically when an API key is available; otherwise they're silently skipped and scholar works fully keyless.
 
@@ -172,6 +190,44 @@ wscrape news "<query>" [--limit N] [--recent d|w|m|y] [--google-news] [--hydrate
 - GDELT returns title, outlet, date, and URL but **no snippet body**. Add `--hydrate` to fetch the top results and attach real snippets (bounded, so it stays cheap).
 - **`--google-news`** additionally queries Google News RSS. Its terms permit **personal, non-commercial use only** — wscrape prints that caveat to stderr; keep it off when results may inform work product. Its `rss/articles/…` links can't be resolved without a browser, so `--hydrate` skips them.
 - A **coverage line on stderr** reports which engines answered (GDELT rate-limits to ~1 request/5s, so an occasional `gdelt failed: HTTP 429` is normal — retry shortly).
+
+**Known limitations**
+- **GDELT may be unreachable on some networks** (data-centre / restricted egress → `gdelt failed: ConnectTimeout`). When that happens, `news` runs Google-News-only — still useful, but Google News is personal-use licensed, so prefer GDELT for work product where you can reach it.
+- **Google News URLs are encrypted redirect stubs** (`news.google.com/rss/articles/…`) that can't be opened directly (they hit a consent wall). `--hydrate` resolves them by searching the headline and matching the source domain, then scrapes the real page for a snippet — so **use `--hydrate` whenever you need to actually read Google-News-sourced articles**, not just list them. Unresolvable stubs are reported on stderr.
+
+## Small-web / community search (longtail)
+
+`longtail` federates keyless small-web/community engines — **Marginalia** (small-web index), **Discourse fan-out** (a curated set of large public forums, one adapter covers thousands of instances), **HN Algolia** — for topics mainstream search under-indexes: forums, niche blogs, dead(ish) communities, HN threads. No API key required.
+
+```bash
+wscrape longtail "<query>" [--limit N] [--engines marginalia,discourse,hn] [--instances host1,host2] [--author <handle>] [--json]
+```
+
+- Reach for `longtail` over `search` when the target is plausibly a forum post, niche blog, or technical discussion rather than an indexed mainstream page.
+- `--author <handle>` sweeps a person's own output instead of searching a term — HN via `tags=author_<handle>`, Discourse via `/u/<handle>/activity.json`. Marginalia has no author endpoint and is skipped in this mode (reported on stderr).
+- `--instances` overrides the default Discourse roster; each instance is federated and reported individually on stderr, so one dead instance never hides the others.
+
+## Historical-web captures (cdx)
+
+`cdx` enumerates historical captures of a URL/domain via the Wayback CDX server (or a Common Crawl index with `--cc`). It is **URL-in, captures-out** — there is no keyless full-text search over archived content, so use it once you have a target, not to discover one.
+
+```bash
+wscrape cdx <url-or-domain> [--match exact|prefix|host|domain] [--from YYYY[MMDD]] [--to YYYY[MMDD]] [--filter field:regex] [--collapse field] [--limit N] [--cc [CRAWL-ID]] [--fetch [N]] [--json]
+```
+
+- `--cc` (bare, or with a crawl id like `CC-MAIN-2026-25`) queries Common Crawl instead of Wayback; bare `--cc` resolves the newest crawl automatically. `--cc` takes precedence over `--base`.
+- `--fetch [N]` (Wayback only, default 3, cap 10) fetches and extracts the top N snapshots — paced politely (archive.org throttles hard); per-snapshot failures are reported, not fatal.
+- Useful for dead links, pre-2010 topics, and person-sweeps that turn up a defunct blog/forum.
+
+## Attested batch probing (probe)
+
+`probe` is deterministic plumbing for the `/hunt` skill (`specs/hunt.spec.md`) — not something to reach for in normal research. It runs a batch of queries across one or more engines with per-engine pacing and canaries, appending an attested JSONL ledger record for every probe as it executes.
+
+```bash
+wscrape probe [query...] --engines ddg,marginalia,hn,discourse,scholar,dblp,openaire,ntrs [--hunt-id ID] [--ledger PATH] [--queries-file FILE] [--limit N]
+```
+
+See `skills/hunt/SKILL.md` for the workflow this drives.
 
 ## Reddit
 
